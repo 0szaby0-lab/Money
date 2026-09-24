@@ -25,6 +25,15 @@ state_lock = Lock()
 working_pool = []
 tested_counter = 0
 
+# Resolve Honeygain target IPs in advance
+TARGET_IPS = ["104.26.12.49", "104.26.13.49", "172.67.75.143"]
+try:
+    resolved = socket.gethostbyname_ex("api.honeygain.com")[2]
+    if resolved:
+        TARGET_IPS = resolved
+except Exception:
+    pass
+
 node_state = {
     "start_time": time.time(),
     "status": "Initializing proxy harvester...",
@@ -68,8 +77,8 @@ def run_health_server():
 
 def test_socks5_candidate(proxy_str):
     """
-    Tests raw SOCKS5 handshake directly towards api.honeygain.com:443.
-    Returns (proxy_str, latency) if successful, None otherwise.
+    Tests raw SOCKS5 handshake using direct IPv4 connect request to Honeygain infrastructure.
+    Using IPv4 Address Type (0x01) ensures compatibility with 100% of public SOCKS5 proxies.
     """
     try:
         ip, port = proxy_str.split(":")
@@ -77,7 +86,7 @@ def test_socks5_candidate(proxy_str):
         start_t = time.time()
 
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(2.5)
+        s.settimeout(3.5)
         s.connect((ip, port))
 
         # Greeting: SOCKS5, 1 auth method (0x00 = No Auth)
@@ -87,9 +96,10 @@ def test_socks5_candidate(proxy_str):
             s.close()
             return None
 
-        # Connect request: connect to api.honeygain.com:443 via proxy
-        target = b"api.honeygain.com"
-        req = b"\x05\x01\x00\x03" + bytes([len(target)]) + target + (443).to_bytes(2, "big")
+        # Connect request: connect to Honeygain IP:443 (Type 0x01 = IPv4)
+        target_ip = TARGET_IPS[0]
+        ip_bytes = socket.inet_aton(target_ip)
+        req = b"\x05\x01\x00\x01" + ip_bytes + (443).to_bytes(2, "big")
         s.sendall(req)
         resp2 = s.recv(10)
         s.close()
@@ -121,7 +131,7 @@ def harvest_and_validate_batch(batch_size=150):
 
     all_list = list(candidates)
     random.shuffle(all_list)
-    print(f"[HARVESTER] Total unique candidates discovered: {len(all_list)}. Testing batch of {min(batch_size, len(all_list))}...")
+    print(f"[HARVESTER] Total unique candidates: {len(all_list)}. Testing batch of {min(batch_size, len(all_list))}...")
 
     batch = all_list[:batch_size]
     with state_lock:
@@ -135,7 +145,7 @@ def harvest_and_validate_batch(batch_size=150):
                 verified.append(res)
 
     verified.sort(key=lambda x: x[1])
-    print(f"[HARVESTER] Batch complete. Valid operational proxies found: {len(verified)}")
+    print(f"[HARVESTER] Batch complete! Verified functional proxies found: {len(verified)}")
     with state_lock:
         for p, lat in verified:
             if p not in working_pool:
@@ -153,13 +163,14 @@ def background_harvester_daemon():
                 harvest_and_validate_batch(batch_size=200)
         except Exception as e:
             print(f"[HARVESTER] Error during harvest cycle: {e}")
-        time.sleep(30)
+        time.sleep(25)
 
 def update_proxychains_conf(ip, port):
-    """Configures proxychains to route all TCP connections through the chosen proxy."""
+    """
+    Configures proxychains to route all TCP connections through the chosen proxy.
+    Notice: proxy_dns is omitted so DNS resolves locally to anycast IPs, avoiding proxy DNS drops.
+    """
     content = f"""strict_chain
-proxy_dns
-remote_dns_subnet 224
 tcp_read_time_out 10000
 tcp_connect_time_out 5000
 
@@ -208,7 +219,6 @@ def supervise_honeygain():
     proxychains_bin = "proxychains4" if shutil.which("proxychains4") else "proxychains"
 
     while True:
-        # Check if user set static CUSTOM_PROXY
         if custom_proxy:
             active_target = custom_proxy
             if "://" in custom_proxy:
@@ -221,7 +231,6 @@ def supervise_honeygain():
                 target_ip = parts[1] if len(parts) > 1 else "127.0.0.1"
                 target_port = parts[2] if len(parts) > 2 else "1080"
         else:
-            # Pop next proxy from verified working pool
             proxy_candidate = None
             while not proxy_candidate:
                 with state_lock:
@@ -240,7 +249,7 @@ def supervise_honeygain():
         with state_lock:
             node_state["attempts"] += 1
             node_state["active_proxy"] = active_target
-            node_state["status"] = f"Testing candidate node: {active_target} (attempt #{node_state['attempts']})"
+            node_state["status"] = f"Testing node: {active_target} (attempt #{node_state['attempts']})"
             node_state["honeygain_running"] = True
 
         print(f"\n[SUPERVISOR] === Launching Honeygain on node: {active_target} ===")
@@ -273,14 +282,12 @@ def supervise_honeygain():
                 with state_lock:
                     node_state["last_log"] = clean
 
-                # Detect network unusable / fraud block
                 if "API Error: Network Unusable" in clean or "Network Overused" in clean:
-                    print(f"[SUPERVISOR] Node {active_target} rejected by Honeygain perimeter ({clean}).")
+                    print(f"[SUPERVISOR] Node {active_target} rejected ({clean}). Rotating...")
                     rejected_by_network = True
                     proc.terminate()
                     break
 
-                # If running for more than 40 seconds without rejection, it is accepted!
                 elapsed = time.time() - start_launch_time
                 if elapsed > 40 and not rejected_by_network:
                     with state_lock:
@@ -293,7 +300,6 @@ def supervise_honeygain():
                 node_state["honeygain_running"] = False
 
             if rejected_by_network:
-                print(f"[SUPERVISOR] Rotating to next candidate in queue...\n")
                 time.sleep(1)
             else:
                 print(f"[SUPERVISOR] Process exited. Waiting 5s before reconnecting...\n")
@@ -306,7 +312,7 @@ def supervise_honeygain():
 if __name__ == "__main__":
     print("==================================================")
     print(" Honeygain Automated Public Proxy Hunter & Runner")
-    print(" Mode: Multi-Source Harvesting & Active Failover")
+    print(" Mode: Direct IPv4 Connect & Active Failover")
     print("==================================================")
 
     # 1. Start HTTP Health Server for Render
