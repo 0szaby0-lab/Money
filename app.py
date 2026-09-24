@@ -13,8 +13,7 @@ import json
 
 PORT = int(os.environ.get("PORT", 10000))
 PROXY_PORT = 1080
-HTTP_PROXY_PORT = 8080
-WARP_ENDPOINT_DEFAULT = "162.159.192.1:2408"
+WARP_ENDPOINT_DEFAULT = "engage.cloudflareclient.com:2408"
 WARP_PEER_PUBKEY_DEFAULT = "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
 APP_DIR = "/app"
 WGCF_PROFILE_PATH = os.path.join(APP_DIR, "wgcf-profile.conf")
@@ -131,41 +130,52 @@ AllowedIPs = 0.0.0.0/0
         print(f"[WARP-INIT] Auto-registration encountered exception: {e}")
 
     print("[WARP-INIT] Notice: Automated registration was rate-limited or blocked by Cloudflare API.")
-    print("[WARP-INIT] You can supply your own WARP keys via Render Environment Variables:")
-    print("[WARP-INIT] Set WARP_PRIVATE_KEY or WARP_CONF_BASE64 in Render dashboard.")
+    print("[WARP-INIT] You can run 'python register_warp.py' on your local computer,")
+    print("[WARP-INIT] then copy WARP_PRIVATE_KEY or WARP_CONF_BASE64 into the Render dashboard.")
     return False
 
 def build_wireproxy_conf():
-    """Generates wireproxy.conf from the WireGuard profile and attaches SOCKS5/HTTP proxies."""
+    """Generates wireproxy.conf from the WireGuard profile, ensuring proper IPv4 routing and SOCKS5 proxy."""
     if not os.path.exists(WGCF_PROFILE_PATH):
         raise FileNotFoundError(f"Missing {WGCF_PROFILE_PATH}")
 
     with open(WGCF_PROFILE_PATH, "r") as f:
-        lines = f.readlines()
+        raw_conf = f.read()
 
     clean_lines = []
-    for line in lines:
-        stripped = line.strip()
-        # Filter out IPv6 addresses to prevent Docker routing/binding conflicts
-        if stripped.startswith("Address") and ":" in stripped:
+    for line in raw_conf.splitlines():
+        line_s = line.strip()
+        if not line_s or line_s.startswith("#"):
             continue
-        if stripped.startswith("AllowedIPs") and "::/0" in stripped:
+        if line_s.startswith("["):
+            clean_lines.append(line_s)
             continue
-        clean_lines.append(line)
+        if "=" in line_s:
+            key, val = [x.strip() for x in line_s.split("=", 1)]
+            if key == "Address":
+                # Extract only IPv4 address (e.g. 172.16.0.2/32)
+                ipv4_parts = [p.strip() for p in val.split(",") if ":" not in p]
+                val = ipv4_parts[0] if ipv4_parts else "172.16.0.2/32"
+                clean_lines.append(f"Address = {val}")
+            elif key == "AllowedIPs":
+                # Route all IPv4 traffic through WARP
+                clean_lines.append("AllowedIPs = 0.0.0.0/0")
+            elif key == "DNS":
+                # Route DNS via Cloudflare 1.1.1.1 UDP
+                clean_lines.append("DNS = 1.1.1.1")
+            elif key == "Endpoint":
+                clean_lines.append(f"Endpoint = {val}")
+            else:
+                clean_lines.append(f"{key} = {val}")
 
-    wireproxy_conf = "".join(clean_lines)
-
-    proxy_sections = f"""
+    proxy_section = f"""
 [Socks5]
 BindAddress = 127.0.0.1:{PROXY_PORT}
-
-[Http]
-BindAddress = 127.0.0.1:{HTTP_PROXY_PORT}
 """
     with open(WIREPROXY_CONF_PATH, "w") as f:
-        f.write(wireproxy_conf + proxy_sections)
+        f.write("\n".join(clean_lines) + proxy_section)
 
-    print(f"[WIREPROXY] wireproxy.conf successfully created at {WIREPROXY_CONF_PATH}")
+    print(f"[WIREPROXY] wireproxy.conf created successfully at {WIREPROXY_CONF_PATH}")
 
 def start_wireproxy():
     """Launches wireproxy daemon in userspace and verifies the Cloudflare WARP tunnel."""
@@ -200,13 +210,13 @@ def start_wireproxy():
 
     # Verify connection through Cloudflare trace
     print("[WIREPROXY] Testing connection through Cloudflare WARP tunnel...")
-    for attempt in range(5):
+    for attempt in range(6):
         try:
             res = subprocess.run(
                 [
                     "curl", "-s",
                     "--socks5-hostname", f"127.0.0.1:{PROXY_PORT}",
-                    "--max-time", "10",
+                    "--max-time", "8",
                     "https://cloudflare.com/cdn-cgi/trace"
                 ],
                 capture_output=True,
@@ -222,11 +232,14 @@ def start_wireproxy():
                     if line.startswith("ip="):
                         ip_val = line.split("=")[1].strip()
 
-                node_state["warp_connected"] = (warp_val in ("on", "plus"))
-                node_state["warp_ip"] = ip_val
-                node_state["warp_type"] = warp_val
-                print(f"[WIREPROXY] Tunnel confirmed! WARP: {warp_val}, Exit IP: {ip_val}")
-                return proc, True
+                if warp_val in ("on", "plus"):
+                    node_state["warp_connected"] = True
+                    node_state["warp_ip"] = ip_val
+                    node_state["warp_type"] = warp_val
+                    print(f"[WIREPROXY] Tunnel confirmed! WARP: {warp_val}, Exit IP: {ip_val}")
+                    return proc, True
+                else:
+                    print(f"[WIREPROXY] Trace responded but warp={warp_val}")
         except Exception as e:
             print(f"[WIREPROXY] Tunnel verification attempt {attempt+1} failed: {e}")
         time.sleep(2)
@@ -344,16 +357,31 @@ if __name__ == "__main__":
         warp_configured = setup_warp()
         if not warp_configured:
             retry_attempt += 1
+            node_state["last_log"] = f"Waiting for WARP setup (attempt #{retry_attempt})"
             print(f"[SERVER] Retrying WARP setup in 20 seconds (attempt #{retry_attempt})...")
             time.sleep(20)
 
-    # 3. Start wireproxy daemon
-    wireproxy_proc, tunnel_active = start_wireproxy()
-    if not tunnel_active:
-        print("[WARNING] WARP tunnel check was not completed cleanly, starting services anyway...")
+    # 3. Start wireproxy daemon and loop until tunnel is confirmed active!
+    wireproxy_proc = None
+    tunnel_active = False
+    attempt = 0
+    while not tunnel_active:
+        attempt += 1
+        print(f"[INIT] Establishing Cloudflare WARP tunnel (attempt #{attempt})...")
+        if wireproxy_proc and wireproxy_proc.poll() is None:
+            wireproxy_proc.terminate()
+            time.sleep(2)
+
+        wireproxy_proc, tunnel_active = start_wireproxy()
+        if not tunnel_active:
+            node_state["last_log"] = f"WARP connecting... (attempt #{attempt})"
+            print(f"[INIT] WARP tunnel not verified yet. Retrying in 10s...")
+            time.sleep(10)
+
+    print("[INIT] Cloudflare WARP verified and active!")
 
     # 4. Configure proxychains
     setup_proxychains()
 
-    # 5. Launch Honeygain Daemon
+    # 5. Launch Honeygain Daemon (only starts after WARP is verified!)
     run_honeygain()
