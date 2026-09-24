@@ -7,11 +7,21 @@ services:
     branch: main
     autoDeploy: true
     envVars:
+      # EarnFM (datacenter OK)
       - key: EARNFM_TOKEN
         sync: false
+      # Traffmonetizer (datacenter OK)
       - key: TM_TOKEN
         sync: false
+      # Repocket (datacenter OK)
       - key: RP_EMAIL
         sync: false
       - key: RP_API_KEY
         sync: false
+      # Honeygain (auto residential proxy)
+      - key: HNY_EMAIL
+        sync: false
+      - key: HNY_PASS
+        sync: false
+      - key: DEVICE_NAME
+        value: "Render-Node"
