@@ -13,3 +13,11 @@ services:
         sync: false
       - key: DEVICE_NAME
         value: "ArmorOS-Render-Node-01"
+      - key: RESIDENTIAL_PROXY_IP
+        sync: false
+      - key: RESIDENTIAL_PROXY_PORT
+        sync: false
+      - key: RESIDENTIAL_PROXY_USER
+        sync: false
+      - key: RESIDENTIAL_PROXY_PASS
+        sync: false
