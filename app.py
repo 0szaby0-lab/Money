@@ -17,7 +17,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Honeygain Node: Active")
     
     def log_message(self, format, *args):
-        pass # Ne logoljon minden webes kérést, hogy spóroljon a lemezműveletekkel
+        pass
 
 def run_server():
     server_address = ('0.0.0.0', PORT)
@@ -35,49 +35,47 @@ def honeygain_daemon():
     current_month = datetime.now().month
     start_tx = get_tx_bytes()
     
-    # Megkeressük a hivatalos Honeygain bináris pontos helyét a konténerben
     bin_path = shutil.which("honeygain")
     if not bin_path:
-        for path in ["/app/honeygain", "/honeygain", "./honeygain"]:
+        for path in ["/app/honeygain", "/honeygain", "./honeygain", "/bin/honeygain"]:
             if os.path.exists(path):
                 bin_path = path
                 break
+    if not bin_path:
+        bin_path = "honeygain"
     
-    proc = subprocess.Popen([
+    email = str(os.getenv("HNY_EMAIL") or "").strip()
+    password = str(os.getenv("HNY_PASS") or "").strip()
+    device = str(os.getenv("DEVICE_NAME") or "ArmorOS-Render-Node-01").strip()
+
+    print(f"[START] Launching Honeygain node: {device} using binary {bin_path}")
+    
+    cmd = [
         bin_path, 
         "-tou-accept", 
-        "-email", os.getenv("HNY_EMAIL"), 
-        "-pass", os.getenv("HNY_PASS"), 
-        "-device", os.getenv("DEVICE_NAME")
-    ])
+        "-email", email, 
+        "-pass", password, 
+        "-device", device
+    ]
+
+    proc = subprocess.Popen(cmd)
 
     while True:
-        # Ha új hónap kezdődik, nullázzuk a számlálót
         if datetime.now().month != current_month:
             current_month = datetime.now().month
             start_tx = get_tx_bytes()
             if proc.poll() is not None:
-                proc = subprocess.Popen([
-                    bin_path, 
-                    "-tou-accept", 
-                    "-email", os.getenv("HNY_EMAIL"), 
-                    "-pass", os.getenv("HNY_PASS"), 
-                    "-device", os.getenv("DEVICE_NAME")
-                ])
+                proc = subprocess.Popen(cmd)
 
-        # Adatforgalom ellenőrzése
         current_tx = get_tx_bytes() - start_tx
         if current_tx >= LIMIT_BYTES:
             if proc.poll() is None:
                 proc.terminate()
                 print("99 GB limit reached. Halting operations until next month.")
         
-        time.sleep(300) # 5 percenként ellenőriz
+        time.sleep(15)
 
 if __name__ == '__main__':
-    # Web szerver indítása külön szálon (hogy a Render lássa, a szolgáltatás fut)
     server_thread = Thread(target=run_server, daemon=True)
     server_thread.start()
-    
-    # Fő Honeygain folyamat indítása
     honeygain_daemon()

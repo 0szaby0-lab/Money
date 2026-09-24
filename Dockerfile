@@ -13,4 +13,5 @@ COPY app.py /app/app.py
 
 EXPOSE 10000
 
-CMD ["python3", "app.py"]
+# Felülírjuk az alap kép ENTRYPOINT-ját, hogy az app.py induljon el!
+ENTRYPOINT ["python3", "/app/app.py"]
