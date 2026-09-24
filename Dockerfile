@@ -1,25 +1,14 @@
-# 1. lépés: Hivatalos Honeygain konténer
-FROM honeygain/honeygain:latest AS honeygain-source
+# Dockerfile
+FROM honeygain/honeygain:latest
 
-# 2. lépés: Python futtatókörnyezet a webes szerverhez és monitoringhoz
-FROM python:3.11-slim
+# Jogosultság emelése a Python telepítéséhez
+USER root
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    procps \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# Csomagkezelő detektálása és Python telepítése a webes ping és monitorozás miatt
+RUN command -v apk >/dev/null && apk add --no-cache python3 || \
+    (apt-get update && apt-get install -y python3)
 
 WORKDIR /app
-
-# A teljes /app mappát átmásoljuk (a .so könyvtárakkal és függőségekkel együtt)
-COPY --from=honeygain-source /app /app
-RUN chmod +x /app/honeygain
-
-# Beállítjuk a dinamikus linker útvonalát, hogy megtalálja a libhg.so-t
-ENV LD_LIBRARY_PATH="/app:$LD_LIBRARY_PATH"
-
-# Alkalmazás script bemásolása
 COPY app.py /app/app.py
 
 EXPOSE 10000
