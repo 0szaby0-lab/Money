@@ -1,20 +1,22 @@
-# Dockerfile - Corrected Production Build
+# 1. lépés: Hivatalos Honeygain konténerből kinyerjük a binárist
+FROM honeygain/honeygain:latest AS honeygain-source
+
+# 2. lépés: Python alapú futtatókörnyezet a webes ping és adatforgalom-figyelő miatt
 FROM python:3.11-slim
 
-# Install runtime utilities [VERIFIED]
+# Alapvető csomagok telepítése (Debian kompatibilis)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
-    libc6-compat \
+    procps \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Note: Honeygain does not offer a direct public unauthenticated raw binary link.
-# For production deployment, we pull the official Debian package or execute via official container structure.
-# Below is the updated step to fetch and unpack the official package safely [VERIFIED].
-RUN curl -sL https://global.honeygain.com/downloads/linux/honeygain -o honeygain || true
-RUN chmod +x honeygain || true
+# Átmásoljuk a hivatalos futtatható binárist
+COPY --from=honeygain-source /app/honeygain /app/honeygain
+RUN chmod +x /app/honeygain
 
+# Alkalmazás script másolása
 COPY app.py /app/app.py
 
 EXPOSE 10000
