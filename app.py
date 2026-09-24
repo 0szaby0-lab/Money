@@ -21,7 +21,7 @@ PROXY_SOURCES = [
     "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
     "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
-    "https://raw.githubusercontent.com/roosterkid/openproxies/main/socks5_proxies.txt"
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=3000&country=all"
 ]
 
 state_lock = Lock()
@@ -58,11 +58,11 @@ def run_health_server():
     server.serve_forever()
 
 def check_socks5_handshake(proxy_str):
-    """Tests raw SOCKS5 handshake (b'\x05\x01\x00' -> b'\x05\x00') in under 2.5 seconds."""
+    """Verifies live SOCKS5 handshake (b'\x05\x01\x00' -> b'\x05\x00') in under 2.0s."""
     try:
         ip, port = proxy_str.split(":")
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(2.5)
+        s.settimeout(2.0)
         s.connect((ip, int(port)))
         s.sendall(b"\x05\x01\x00")
         resp = s.recv(2)
@@ -74,58 +74,71 @@ def check_socks5_handshake(proxy_str):
     return None
 
 def fetch_and_filter_residential_proxies():
-    """Scrapes SOCKS5 lists, batch-filters out datacenter IPs via ip-api, and verifies live handshakes."""
+    """
+    High-yield pipeline:
+    1. Scrapes proxy feeds.
+    2. Concurrently handshakes 500 candidates (discovering live ones in ~5s).
+    3. Batch-checks live ones with IP-API (filtering for hosting == False / pure residential).
+    """
     print("[HARVESTER] Scraping public SOCKS5 proxy feeds...")
     candidates = set()
     for src in PROXY_SOURCES:
         try:
             req = urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
+            with urllib.request.urlopen(req, timeout=6) as resp:
                 lines = resp.read().decode("utf-8", errors="ignore").splitlines()
                 for line in lines:
                     line = line.strip()
                     if ":" in line and not line.startswith("#"):
                         candidates.add(line)
         except Exception as e:
-            print(f"[HARVESTER] Warning reading {src.split('/')[-1]}: {e}")
+            pass
 
-    raw_list = list(candidates)
-    random.shuffle(raw_list)
-    print(f"[HARVESTER] Total scraped candidates: {len(raw_list)}. Selecting batch of 100 for residential filtering...")
+    all_cands = list(candidates)
+    random.shuffle(all_cands)
+    test_batch = all_cands[:600]
+    print(f"[HARVESTER] Scraped {len(all_cands)} proxies. Testing live handshakes on {len(test_batch)} candidates...")
 
-    batch = raw_list[:100]
-    query_payload = [{"query": p.split(":")[0], "fields": "query,hosting"} for p in batch]
+    live_proxies = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
+        for res in executor.map(check_socks5_handshake, test_batch):
+            if res:
+                live_proxies.append(res)
 
-    residential_ips = set()
+    print(f"[HARVESTER] Live responsive SOCKS5 proxies found: {len(live_proxies)}")
+    if not live_proxies:
+        return
+
+    # Check live proxies with IP-API batch for residential classification (max 100 per request)
+    batch_to_query = live_proxies[:100]
+    payload = [{"query": p.split(":")[0], "fields": "query,hosting,isp,country"} for p in batch_to_query]
+
+    residential_map = {}
     try:
-        data = json.dumps(query_payload).encode()
+        data = json.dumps(payload).encode()
         req = urllib.request.Request("http://ip-api.com/batch", data=data, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=8) as resp:
             results = json.loads(resp.read().decode())
             for item in results:
                 if not item.get("hosting"):  # hosting == False means Residential ISP!
-                    residential_ips.add(item.get("query"))
+                    residential_map[item.get("query")] = item
     except Exception as e:
-        print(f"[HARVESTER] Residential filter error: {e}")
+        print(f"[HARVESTER] IP-API batch lookup error: {e}")
 
-    residential_candidates = [p for p in batch if p.split(":")[0] in residential_ips]
-    print(f"[HARVESTER] Residential ISP candidates found: {len(residential_candidates)}. Testing live handshakes...")
+    verified_residential = [p for p in batch_to_query if p.split(":")[0] in residential_map]
+    print(f"[HARVESTER] Verified LIVE Residential proxies found: {len(verified_residential)}")
 
-    verified = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
-        for res in executor.map(check_socks5_handshake, residential_candidates):
-            if res:
-                verified.append(res)
-
-    print(f"[HARVESTER] Live verified residential proxies: {len(verified)}")
     with state_lock:
-        for p in verified:
+        for p in verified_residential:
             if p not in working_residential_pool:
                 working_residential_pool.append(p)
+                ip = p.split(":")[0]
+                info = residential_map.get(ip, {})
+                print(f"[HARVESTER] Added: {p} -> {info.get('isp')} ({info.get('country')})")
         node_state["pool_size"] = len(working_residential_pool)
 
 def background_harvester():
-    """Replenishes the pool whenever it drops below 5 proxies."""
+    """Keeps the residential pool well-stocked."""
     while True:
         try:
             with state_lock:
@@ -134,7 +147,7 @@ def background_harvester():
                 fetch_and_filter_residential_proxies()
         except Exception as e:
             print(f"[HARVESTER] Error in harvest loop: {e}")
-        time.sleep(30)
+        time.sleep(20)
 
 def update_proxychains(ip, port):
     conf_content = f"""strict_chain
@@ -190,8 +203,8 @@ def supervise_honeygain():
                         node_state["pool_size"] = len(working_residential_pool)
                 if not target_proxy:
                     with state_lock:
-                        node_state["status"] = "Waiting for verified residential proxy..."
-                    time.sleep(3)
+                        node_state["status"] = "Harvesting live residential proxies..."
+                    time.sleep(2)
 
         ip, port = target_proxy.split(":")
         print(f"\n[SUPERVISOR] >>> Connecting Honeygain via Residential Proxy: {target_proxy} <<<")
@@ -230,7 +243,7 @@ def supervise_honeygain():
                     node_state["last_log"] = clean
 
                 if "API Error: Network Unusable" in clean or "Network Overused" in clean:
-                    print(f"[SUPERVISOR] Proxy {target_proxy} rejected by Honeygain perimeter. Rotating...")
+                    print(f"[SUPERVISOR] Node {target_proxy} rejected by Honeygain perimeter. Rotating...")
                     rejected = True
                     proc.terminate()
                     break
@@ -244,8 +257,8 @@ def supervise_honeygain():
             if rejected:
                 time.sleep(1)
             else:
-                print("[SUPERVISOR] Process ended. Reconnecting in 5s...")
-                time.sleep(5)
+                print("[SUPERVISOR] Process ended. Reconnecting in 3s...")
+                time.sleep(3)
 
         except Exception as e:
             print(f"[SUPERVISOR] Error running node: {e}")
@@ -260,7 +273,7 @@ if __name__ == "__main__":
     server_t = Thread(target=run_health_server, daemon=True)
     server_t.start()
 
-    # 2. Pre-fill residential pool
+    # 2. Initial Residential Harvest Sweep
     if not CUSTOM_PROXY:
         fetch_and_filter_residential_proxies()
         harvester_t = Thread(target=background_harvester, daemon=True)
