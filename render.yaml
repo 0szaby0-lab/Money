@@ -1,9 +1,8 @@
-# render.yaml - Render Blueprint for Honeygain Node with Cloudflare 1.1.1.1 WARP
 services:
   - type: web
-    name: honeygain-warp-node
+    name: armoros-honeygain-node
     env: docker
-    region: frankfurt
+    region: ohio
     plan: free
     branch: main
     autoDeploy: true
@@ -13,12 +12,4 @@ services:
       - key: HNY_PASS
         sync: false
       - key: DEVICE_NAME
-        value: "Render-Cloudflare-Warp-01"
-      - key: CUSTOM_PROXY
-        sync: false
-      - key: WARP_CONF_BASE64
-        sync: false
-      - key: WARP_PRIVATE_KEY
-        sync: false
-      - key: WARP_ADDRESS
-        value: "172.16.0.2/32"
+        value: "ArmorOS-Render-Node-01"
