@@ -6,6 +6,7 @@ import socket
 import random
 import shutil
 import urllib.request
+from urllib.parse import urlparse
 import subprocess
 import concurrent.futures
 from threading import Thread, Lock
@@ -71,13 +72,11 @@ def verify_proxy_to_honeygain_api(proxy_str):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(2.5)
         s.connect((ip, int(port)))
-        # Handshake
         s.sendall(b"\x05\x01\x00")
         resp1 = s.recv(2)
         if resp1 != b"\x05\x00":
             s.close()
             return None
-        # Connect to api.honeygain.com:443
         s.sendall(HG_CONNECT_REQ)
         resp2 = s.recv(10)
         s.close()
@@ -117,7 +116,6 @@ def fetch_and_filter_residential_proxies():
     if not api_capable_proxies:
         return
 
-    # Check residential status on API-capable proxies
     batch_to_query = api_capable_proxies[:100]
     payload = [{"query": p.split(":")[0], "fields": "query,hosting,isp,country"} for p in batch_to_query]
 
@@ -156,14 +154,40 @@ def background_harvester():
             print(f"[HARVESTER] Error in harvest loop: {e}")
         time.sleep(20)
 
-def update_proxychains(ip, port):
+def parse_proxy_string(proxy_str):
+    """
+    Parses proxy string into: (proto, ip, port, user, password)
+    Supports:
+      - http://user:pass@ip:port
+      - socks5://user:pass@ip:port
+      - http://ip:port
+      - socks5://ip:port
+      - ip:port
+    """
+    proxy_str = proxy_str.strip()
+    if "://" not in proxy_str:
+        proxy_str = f"http://{proxy_str}"
+    
+    parsed = urlparse(proxy_str)
+    proto = parsed.scheme.lower() or "http"
+    ip = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (1080 if proto.startswith("socks") else 8080)
+    user = parsed.username or ""
+    passwd = parsed.password or ""
+    return proto, ip, port, user, passwd
+
+def update_proxychains_conf(proto, ip, port, user="", passwd=""):
+    """Configures proxychains4 with protocol, auth credentials, and timeouts."""
+    auth_str = f" {user} {passwd}" if user and passwd else ""
+    line = f"{proto} {ip} {port}{auth_str}\n"
+
     conf_content = f"""strict_chain
 tcp_read_time_out 15000
 tcp_connect_time_out 8000
 
 [ProxyList]
-socks5 {ip} {port}
-"""
+{line}"""
+
     for path in ["/etc/proxychains.conf", "/etc/proxychains4.conf", "/etc/proxychains/proxychains.conf"]:
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -199,28 +223,34 @@ def supervise_honeygain():
     print(f"[SUPERVISOR] Using Honeygain binary: {bin_path} with wrapper {proxychains_bin}")
 
     while True:
-        target_proxy = None
+        proto, ip, port, user, passwd = "http", "127.0.0.1", 8080, "", ""
+        target_display = "None"
+
         if CUSTOM_PROXY:
-            target_proxy = CUSTOM_PROXY
+            proto, ip, port, user, passwd = parse_proxy_string(CUSTOM_PROXY)
+            target_display = f"{proto}://{ip}:{port}"
         else:
-            while not target_proxy:
+            target_candidate = None
+            while not target_candidate:
                 with state_lock:
                     if working_residential_pool:
-                        target_proxy = working_residential_pool.pop(0)
+                        target_candidate = working_residential_pool.pop(0)
                         node_state["pool_size"] = len(working_residential_pool)
-                if not target_proxy:
+                if not target_candidate:
                     with state_lock:
                         node_state["status"] = "Harvesting API-verified residential proxies..."
                     time.sleep(2)
+            proto = "socks5"
+            ip, port = target_candidate.split(":")
+            target_display = f"socks5://{ip}:{port}"
 
-        ip, port = target_proxy.split(":")
-        print(f"\n[SUPERVISOR] >>> Launching Honeygain via API-Verified Residential Node: {target_proxy} <<<")
-        update_proxychains(ip, port)
+        print(f"\n[SUPERVISOR] >>> Launching Honeygain via Proxy: {target_display} <<<")
+        update_proxychains_conf(proto, ip, port, user, passwd)
 
         with state_lock:
             node_state["attempts"] += 1
-            node_state["active_proxy"] = target_proxy
-            node_state["status"] = f"Running on {target_proxy}"
+            node_state["active_proxy"] = target_display
+            node_state["status"] = f"Running on {target_display}"
 
         cmd = [
             proxychains_bin, "-q",
@@ -250,21 +280,21 @@ def supervise_honeygain():
                     node_state["last_log"] = clean
 
                 if "API Error: Network Unusable" in clean or "Network Overused" in clean:
-                    print(f"[SUPERVISOR] Node {target_proxy} rejected by Honeygain perimeter. Rotating...")
+                    print(f"[SUPERVISOR] Node {target_display} rejected by Honeygain perimeter. Rotating...")
                     rejected = True
                     proc.terminate()
                     break
 
                 if time.time() - start_time > 35 and not rejected:
                     with state_lock:
-                        node_state["status"] = f"ACTIVE & EARNING via {target_proxy}"
-                        print(f"[SUCCESS] >>> Node {target_proxy} ACCEPTED by Honeygain! Actively earning. <<<")
+                        node_state["status"] = f"ACTIVE & EARNING via {target_display}"
+                        print(f"[SUCCESS] >>> Node {target_display} ACCEPTED by Honeygain! Actively earning. <<<")
 
             proc.wait()
             if rejected:
                 time.sleep(1)
             else:
-                print(f"[SUPERVISOR] Node {target_proxy} exited (code {proc.returncode}). Reconnecting in 3s...")
+                print(f"[SUPERVISOR] Node {target_display} exited (code {proc.returncode}). Reconnecting in 3s...")
                 time.sleep(3)
 
         except Exception as e:
