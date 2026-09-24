@@ -1,7 +1,5 @@
 #!/bin/sh
-# entrypoint.sh
+set -e
 
-# Run initial proxy harvesting and testing before booting the main daemon
-python3 /app/app.py --init-proxies
-
-exec python3 /app/app.py
+# Forward all arguments and execute python orchestrator with unbuffered output
+exec python3 -u /app/app.py "$@"
