@@ -1,17 +1,16 @@
-# Dockerfile
-FROM honeygain/honeygain:latest
+# Dockerfile - EarnFM 24/7 Passive Income Node for Render.com Free Web Service
+FROM earnfm/earnfm-client:latest
 
-# Jogosultság emelése a Python telepítéséhez
 USER root
 
-# Csomagkezelő detektálása és Python telepítése a webes ping és monitorozás miatt
-RUN command -v apk >/dev/null && apk add --no-cache python3 || \
-    (apt-get update && apt-get install -y python3)
+# Install Python 3 for the Render HTTP health check web server
+RUN apk update && apk add --no-cache python3
 
 WORKDIR /app
+
 COPY app.py /app/app.py
 
+# Render binds to $PORT (default 10000)
 EXPOSE 10000
 
-# Felülírjuk az alap kép ENTRYPOINT-ját, hogy az app.py induljon el!
-ENTRYPOINT ["python3", "/app/app.py"]
+ENTRYPOINT ["python3", "-u", "/app/app.py"]
