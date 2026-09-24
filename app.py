@@ -2,41 +2,26 @@ import os
 import sys
 import time
 import json
-import socket
-import random
+import glob
 import shutil
-import urllib.request
-from urllib.parse import urlparse
 import subprocess
-import concurrent.futures
 from threading import Thread, Lock
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 PORT = int(os.environ.get("PORT", 10000))
-EMAIL = os.environ.get("HNY_EMAIL", "").strip()
-PASS = os.environ.get("HNY_PASS", "").strip()
-DEVICE = os.environ.get("DEVICE_NAME", "Render-Honeygain-Node").strip()
-CUSTOM_PROXY = os.environ.get("CUSTOM_PROXY", "").strip()
 
-PROXY_SOURCES = [
-    "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
-    "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
-    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=3000&country=all"
-]
+# EarnFM
+EARNFM_TOKEN = os.environ.get("EARNFM_TOKEN", "").strip()
+
+# Traffmonetizer
+TM_TOKEN = os.environ.get("TM_TOKEN", "").strip()
+
+# Repocket
+RP_EMAIL = os.environ.get("RP_EMAIL", "").strip()
+RP_API_KEY = os.environ.get("RP_API_KEY", "").strip()
 
 state_lock = Lock()
-working_residential_pool = []
-node_state = {
-    "status": "Initializing...",
-    "attempts": 0,
-    "active_proxy": "None",
-    "last_log": "Starting",
-    "pool_size": 0
-}
-
-HG_DOMAIN = b"api.honeygain.com"
-HG_CONNECT_REQ = b"\x05\x01\x00\x03" + bytes([len(HG_DOMAIN)]) + HG_DOMAIN + b"\x01\xbb"
+app_states = {}
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -45,11 +30,8 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.end_headers()
         with state_lock:
             body = json.dumps({
-                "service": "Honeygain Residential Node",
-                "status": node_state["status"],
-                "active_proxy": node_state["active_proxy"],
-                "verified_pool_size": node_state["pool_size"],
-                "last_log": node_state["last_log"]
+                "service": "Multi-App Passive Income Node",
+                "apps": dict(app_states)
             }).encode()
         self.wfile.write(body)
 
@@ -61,257 +43,212 @@ def run_health_server():
     print(f"[HTTP] Render health check server running on port {PORT}")
     server.serve_forever()
 
-def verify_proxy_to_honeygain_api(proxy_str):
-    """
-    Two-step verification:
-    1. SOCKS5 handshake.
-    2. TCP tunnel directly to api.honeygain.com:443.
-    """
-    try:
-        ip, port = proxy_str.split(":")
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(2.5)
-        s.connect((ip, int(port)))
-        s.sendall(b"\x05\x01\x00")
-        resp1 = s.recv(2)
-        if resp1 != b"\x05\x00":
-            s.close()
-            return None
-        s.sendall(HG_CONNECT_REQ)
-        resp2 = s.recv(10)
-        s.close()
-        if len(resp2) >= 2 and resp2[1] == 0:
-            return proxy_str
-    except Exception:
-        pass
+def find_binary(search_dirs, names):
+    """Search for an executable binary by name in given directories."""
+    for d in search_dirs:
+        if not os.path.isdir(d):
+            continue
+        for root, dirs, files in os.walk(d):
+            for name in names:
+                path = os.path.join(root, name)
+                if os.path.isfile(path):
+                    os.chmod(path, 0o755)
+                    return path
+        # Fallback: find any executable
+        for root, dirs, files in os.walk(d):
+            for f in files:
+                fpath = os.path.join(root, f)
+                if os.path.isfile(fpath) and os.access(fpath, os.X_OK) and not f.endswith(('.py', '.sh', '.conf', '.txt', '.md', '.json', '.yml', '.yaml')):
+                    st = os.stat(fpath)
+                    if st.st_size > 50000:  # Real binary, not a script
+                        return fpath
     return None
 
-def fetch_and_filter_residential_proxies():
-    print("[HARVESTER] Scraping public SOCKS5 proxy feeds...")
-    candidates = set()
-    for src in PROXY_SOURCES:
-        try:
-            req = urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=6) as resp:
-                lines = resp.read().decode("utf-8", errors="ignore").splitlines()
-                for line in lines:
-                    line = line.strip()
-                    if ":" in line and not line.startswith("#"):
-                        candidates.add(line)
-        except Exception:
-            pass
+def list_stage_contents(label, path):
+    """Debug: list files in a stage directory."""
+    if not os.path.isdir(path):
+        print(f"[DEBUG] {label}: directory {path} does not exist")
+        return
+    for root, dirs, files in os.walk(path):
+        for f in files:
+            fpath = os.path.join(root, f)
+            try:
+                sz = os.path.getsize(fpath)
+                ex = os.access(fpath, os.X_OK)
+                if sz > 10000:
+                    print(f"[DEBUG] {label}: {fpath} ({sz} bytes, exec={ex})")
+            except:
+                pass
 
-    all_cands = list(candidates)
-    random.shuffle(all_cands)
-    test_batch = all_cands[:500]
-    print(f"[HARVESTER] Testing full Honeygain API tunnel on {len(test_batch)} candidates...")
-
-    api_capable_proxies = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=80) as executor:
-        for res in executor.map(verify_proxy_to_honeygain_api, test_batch):
-            if res:
-                api_capable_proxies.append(res)
-
-    print(f"[HARVESTER] Proxies with working tunnel to api.honeygain.com: {len(api_capable_proxies)}")
-    if not api_capable_proxies:
+def run_earnfm():
+    """Run EarnFM client in a loop."""
+    if not EARNFM_TOKEN:
+        print("[EARNFM] Skipped: EARNFM_TOKEN not set")
+        with state_lock:
+            app_states["earnfm"] = "Skipped (no token)"
         return
 
-    batch_to_query = api_capable_proxies[:100]
-    payload = [{"query": p.split(":")[0], "fields": "query,hosting,isp,country"} for p in batch_to_query]
-
-    residential_map = {}
-    try:
-        data = json.dumps(payload).encode()
-        req = urllib.request.Request("http://ip-api.com/batch", data=data, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            results = json.loads(resp.read().decode())
-            for item in results:
-                if not item.get("hosting"):
-                    residential_map[item.get("query")] = item
-    except Exception as e:
-        print(f"[HARVESTER] IP-API batch lookup error: {e}")
-
-    verified_residential = [p for p in batch_to_query if p.split(":")[0] in residential_map]
-    print(f"[HARVESTER] Verified API-REACHABLE Residential proxies: {len(verified_residential)}")
-
-    with state_lock:
-        for p in verified_residential:
-            if p not in working_residential_pool:
-                working_residential_pool.append(p)
-                ip = p.split(":")[0]
-                info = residential_map.get(ip, {})
-                print(f"[HARVESTER] Verified ready: {p} -> {info.get('isp')} ({info.get('country')})")
-        node_state["pool_size"] = len(working_residential_pool)
-
-def background_harvester():
-    while True:
-        try:
-            with state_lock:
-                current_len = len(working_residential_pool)
-            if current_len < 5:
-                fetch_and_filter_residential_proxies()
-        except Exception as e:
-            print(f"[HARVESTER] Error in harvest loop: {e}")
-        time.sleep(20)
-
-def parse_proxy_string(proxy_str):
-    """
-    Parses proxy string into: (proto, ip, port, user, password)
-    Supports:
-      - http://user:pass@ip:port
-      - socks5://user:pass@ip:port
-      - http://ip:port
-      - socks5://ip:port
-      - ip:port
-    """
-    proxy_str = proxy_str.strip()
-    if "://" not in proxy_str:
-        proxy_str = f"http://{proxy_str}"
-    
-    parsed = urlparse(proxy_str)
-    proto = parsed.scheme.lower() or "http"
-    ip = parsed.hostname or "127.0.0.1"
-    port = parsed.port or (1080 if proto.startswith("socks") else 8080)
-    user = parsed.username or ""
-    passwd = parsed.password or ""
-    return proto, ip, port, user, passwd
-
-def update_proxychains_conf(proto, ip, port, user="", passwd=""):
-    """Configures proxychains4 with protocol, auth credentials, and timeouts."""
-    auth_str = f" {user} {passwd}" if user and passwd else ""
-    line = f"{proto} {ip} {port}{auth_str}\n"
-
-    conf_content = f"""strict_chain
-tcp_read_time_out 15000
-tcp_connect_time_out 8000
-
-[ProxyList]
-{line}"""
-
-    for path in ["/etc/proxychains.conf", "/etc/proxychains4.conf", "/etc/proxychains/proxychains.conf"]:
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w") as f:
-                f.write(conf_content)
-        except Exception:
-            pass
-
-def find_honeygain_binary():
-    candidates = [
-        shutil.which("honeygain"),
-        "/app/honeygain",
-        "/honeygain",
-        "./honeygain",
-        "/bin/honeygain",
-        "/usr/local/bin/honeygain"
-    ]
-    for c in candidates:
-        if c and os.path.isfile(c):
-            return c
-    return "honeygain"
-
-def supervise_honeygain():
-    if not EMAIL or not PASS:
-        print("[SUPERVISOR] ERROR: HNY_EMAIL or HNY_PASS environment variables are missing!")
+    list_stage_contents("EARNFM", "/app/earnfm")
+    binary = find_binary(["/app/earnfm"], ["earnfm_example", "main", "earnfm"])
+    if not binary:
+        print("[EARNFM] ERROR: Binary not found in /app/earnfm/")
         with state_lock:
-            node_state["status"] = "Missing HNY_EMAIL or HNY_PASS"
-        while True:
-            time.sleep(30)
+            app_states["earnfm"] = "Error: binary not found"
+        return
 
-    bin_path = find_honeygain_binary()
-    proxychains_bin = "proxychains4" if shutil.which("proxychains4") else "proxychains"
-    print(f"[SUPERVISOR] Using Honeygain binary: {bin_path} with wrapper {proxychains_bin}")
+    print(f"[EARNFM] Using binary: {binary}")
+    env = os.environ.copy()
+    env["EARNFM_TOKEN"] = EARNFM_TOKEN
 
     while True:
-        proto, ip, port, user, passwd = "http", "127.0.0.1", 8080, "", ""
-        target_display = "None"
-
-        if CUSTOM_PROXY:
-            proto, ip, port, user, passwd = parse_proxy_string(CUSTOM_PROXY)
-            target_display = f"{proto}://{ip}:{port}"
-        else:
-            target_candidate = None
-            while not target_candidate:
-                with state_lock:
-                    if working_residential_pool:
-                        target_candidate = working_residential_pool.pop(0)
-                        node_state["pool_size"] = len(working_residential_pool)
-                if not target_candidate:
-                    with state_lock:
-                        node_state["status"] = "Harvesting API-verified residential proxies..."
-                    time.sleep(2)
-            proto = "socks5"
-            ip, port = target_candidate.split(":")
-            target_display = f"socks5://{ip}:{port}"
-
-        print(f"\n[SUPERVISOR] >>> Launching Honeygain via Proxy: {target_display} <<<")
-        update_proxychains_conf(proto, ip, port, user, passwd)
-
         with state_lock:
-            node_state["attempts"] += 1
-            node_state["active_proxy"] = target_display
-            node_state["status"] = f"Running on {target_display}"
-
-        cmd = [
-            proxychains_bin, "-q",
-            bin_path,
-            "-tou-accept",
-            "-email", EMAIL,
-            "-pass", PASS,
-            "-device", DEVICE
-        ]
-
+            app_states["earnfm"] = "Running"
         try:
+            print("[EARNFM] Starting process...")
             proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1
+                [binary], env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1
             )
-
-            rejected = False
-            start_time = time.time()
-
             for line in proc.stdout:
-                clean = line.strip()
-                print(f"[HG-NODE] {clean}")
-                with state_lock:
-                    node_state["last_log"] = clean
-
-                if "API Error: Network Unusable" in clean or "Network Overused" in clean:
-                    print(f"[SUPERVISOR] Node {target_display} rejected by Honeygain perimeter. Rotating...")
-                    rejected = True
-                    proc.terminate()
-                    break
-
-                if time.time() - start_time > 35 and not rejected:
-                    with state_lock:
-                        node_state["status"] = f"ACTIVE & EARNING via {target_display}"
-                        print(f"[SUCCESS] >>> Node {target_display} ACCEPTED by Honeygain! Actively earning. <<<")
-
-            proc.wait()
-            if rejected:
-                time.sleep(1)
-            else:
-                print(f"[SUPERVISOR] Node {target_display} exited (code {proc.returncode}). Reconnecting in 3s...")
-                time.sleep(3)
-
+                print(f"[EARNFM] {line.strip()}")
+            ret = proc.wait()
+            print(f"[EARNFM] Exited with code {ret}. Restarting in 10s...")
         except Exception as e:
-            print(f"[SUPERVISOR] Error running node: {e}")
-            time.sleep(3)
+            print(f"[EARNFM] Error: {e}")
+        with state_lock:
+            app_states["earnfm"] = "Restarting..."
+        time.sleep(10)
+
+def run_traffmonetizer():
+    """Run Traffmonetizer client in a loop."""
+    if not TM_TOKEN:
+        print("[TRAFFMON] Skipped: TM_TOKEN not set")
+        with state_lock:
+            app_states["traffmonetizer"] = "Skipped (no token)"
+        return
+
+    list_stage_contents("TRAFFMON", "/app/tm-stage")
+    binary = find_binary(["/app/tm-stage"], ["Cli", "cli", "traffmonetizer", "tm"])
+    if not binary:
+        # Try searching more broadly
+        for d in ["/app/tm-stage/usr", "/app/tm-stage/bin", "/app/tm-stage/opt"]:
+            binary = find_binary([d], ["Cli", "cli"])
+            if binary:
+                break
+    if not binary:
+        print("[TRAFFMON] ERROR: Binary not found")
+        with state_lock:
+            app_states["traffmonetizer"] = "Error: binary not found"
+        return
+
+    print(f"[TRAFFMON] Using binary: {binary}")
+
+    while True:
+        with state_lock:
+            app_states["traffmonetizer"] = "Running"
+        try:
+            print("[TRAFFMON] Starting process...")
+            proc = subprocess.Popen(
+                [binary, "start", "accept", "--token", TM_TOKEN],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1
+            )
+            for line in proc.stdout:
+                print(f"[TRAFFMON] {line.strip()}")
+            ret = proc.wait()
+            print(f"[TRAFFMON] Exited with code {ret}. Restarting in 10s...")
+        except Exception as e:
+            print(f"[TRAFFMON] Error: {e}")
+        with state_lock:
+            app_states["traffmonetizer"] = "Restarting..."
+        time.sleep(10)
+
+def run_repocket():
+    """Run Repocket client in a loop."""
+    if not RP_EMAIL or not RP_API_KEY:
+        print("[REPOCKET] Skipped: RP_EMAIL or RP_API_KEY not set")
+        with state_lock:
+            app_states["repocket"] = "Skipped (no credentials)"
+        return
+
+    list_stage_contents("REPOCKET", "/app/rp-stage")
+    binary = find_binary(["/app/rp-stage"], ["repocket", "rp"])
+    if not binary:
+        for d in ["/app/rp-stage/usr", "/app/rp-stage/bin", "/app/rp-stage/opt"]:
+            binary = find_binary([d], ["repocket", "rp"])
+            if binary:
+                break
+    if not binary:
+        print("[REPOCKET] ERROR: Binary not found")
+        with state_lock:
+            app_states["repocket"] = "Error: binary not found"
+        return
+
+    print(f"[REPOCKET] Using binary: {binary}")
+    env = os.environ.copy()
+    env["RP_EMAIL"] = RP_EMAIL
+    env["RP_API_KEY"] = RP_API_KEY
+
+    while True:
+        with state_lock:
+            app_states["repocket"] = "Running"
+        try:
+            print("[REPOCKET] Starting process...")
+            proc = subprocess.Popen(
+                [binary], env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1
+            )
+            for line in proc.stdout:
+                print(f"[REPOCKET] {line.strip()}")
+            ret = proc.wait()
+            print(f"[REPOCKET] Exited with code {ret}. Restarting in 10s...")
+        except Exception as e:
+            print(f"[REPOCKET] Error: {e}")
+        with state_lock:
+            app_states["repocket"] = "Restarting..."
+        time.sleep(10)
 
 if __name__ == "__main__":
     print("=========================================================")
-    print(" Honeygain 24/7 Residential Auto-Harvest Node for Render")
+    print(" Multi-App Passive Income Node for Render.com Free Tier")
+    print(" EarnFM + Traffmonetizer + Repocket")
+    print(" All accept datacenter IPs - no proxy needed!")
     print("=========================================================")
-    
+
+    # 1. HTTP health check for Render
     server_t = Thread(target=run_health_server, daemon=True)
     server_t.start()
 
-    if not CUSTOM_PROXY:
-        fetch_and_filter_residential_proxies()
-        harvester_t = Thread(target=background_harvester, daemon=True)
-        harvester_t.start()
+    # 2. Launch all configured apps in parallel
+    threads = []
 
-    supervise_honeygain()
+    if EARNFM_TOKEN:
+        t = Thread(target=run_earnfm, daemon=True)
+        t.start()
+        threads.append(("EarnFM", t))
+
+    if TM_TOKEN:
+        t = Thread(target=run_traffmonetizer, daemon=True)
+        t.start()
+        threads.append(("Traffmonetizer", t))
+
+    if RP_EMAIL and RP_API_KEY:
+        t = Thread(target=run_repocket, daemon=True)
+        t.start()
+        threads.append(("Repocket", t))
+
+    active = [name for name, _ in threads]
+    if active:
+        print(f"[SYSTEM] Active apps: {', '.join(active)}")
+    else:
+        print("[SYSTEM] WARNING: No app tokens configured!")
+        print("[SYSTEM] Set environment variables in Render:")
+        print("[SYSTEM]   EARNFM_TOKEN  - from https://app.earn.fm/")
+        print("[SYSTEM]   TM_TOKEN      - from https://app.traffmonetizer.com/")
+        print("[SYSTEM]   RP_EMAIL + RP_API_KEY - from https://app.repocket.com/")
+
+    # Keep main thread alive
+    while True:
+        time.sleep(60)

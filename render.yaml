@@ -1,17 +1,17 @@
 services:
   - type: web
-    name: honeygain-render-node
+    name: passive-income-node
     env: docker
     region: ohio
     plan: free
     branch: main
     autoDeploy: true
     envVars:
-      - key: HNY_EMAIL
+      - key: EARNFM_TOKEN
         sync: false
-      - key: HNY_PASS
+      - key: TM_TOKEN
         sync: false
-      - key: DEVICE_NAME
-        value: "Honeygain-Render-Node"
-      - key: CUSTOM_PROXY
+      - key: RP_EMAIL
+        sync: false
+      - key: RP_API_KEY
         sync: false

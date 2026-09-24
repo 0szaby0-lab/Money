@@ -1,13 +1,33 @@
-# Dockerfile - Honeygain 24/7 Automated Residential Node for Render
-FROM honeygain/honeygain:latest
+# Multi-App Passive Income Node for Render.com Free Tier
+# Runs EarnFM + Traffmonetizer + Repocket simultaneously
+# All three accept datacenter IPs natively - no proxy needed
 
-USER root
+# Stage 1: Extract EarnFM binary
+FROM earnfm/earnfm-client:latest AS earnfm-source
 
-# Install Python 3, requests, and proxychains for dynamic residential routing
-RUN command -v apk >/dev/null && apk add --no-cache python3 py3-requests proxychains-ng || \
-    (apt-get update && apt-get install -y --no-install-recommends python3 python3-requests proxychains4 && rm -rf /var/lib/apt/lists/*)
+# Stage 2: Extract Traffmonetizer binary
+FROM traffmonetizer/cli_v2 AS tm-source
+
+# Stage 3: Extract Repocket binary
+FROM repocket/repocket AS rp-source
+
+# Stage 4: Final lightweight container
+FROM alpine:latest
+
+RUN apk add --no-cache python3 libstdc++ libgcc ca-certificates libc6-compat
 
 WORKDIR /app
+
+# Copy all three client binaries
+COPY --from=earnfm-source /app/ /app/earnfm/
+COPY --from=tm-source / /app/tm-stage/
+COPY --from=rp-source / /app/rp-stage/
+
+# Make everything executable
+RUN find /app -type f -executable -o -name "*.so*" | head -50 && \
+    chmod -R +x /app/earnfm/ 2>/dev/null || true && \
+    chmod -R +x /app/tm-stage/ 2>/dev/null || true && \
+    chmod -R +x /app/rp-stage/ 2>/dev/null || true
 
 COPY app.py /app/app.py
 
