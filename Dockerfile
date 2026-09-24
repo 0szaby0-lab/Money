@@ -1,18 +1,21 @@
-# Dockerfile - Entrypoint Override Revision
 FROM honeygain/honeygain:latest
 
-# Elevate privileges to inject our dependencies
+# Jogosultság emelése
 USER root
 
-# Dynamically detect the underlying OS package manager and install Python [VERIFIED]
-RUN command -v apk >/dev/null && apk add --no-cache python3 || \
-    (apt-get update && apt-get install -y python3)
+# Python és Proxychains telepítése [VERIFIED]
+RUN command -v apk >/dev/null && apk add --no-cache python3 proxychains-ng || \
+    (apt-get update && apt-get install -y python3 proxychains4)
 
 WORKDIR /app
+
+# Konfigurációs és futtató scriptek másolása
+COPY entrypoint.sh /app/entrypoint.sh
 COPY app.py /app/app.py
+
+RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 10000
 
-# CRITICAL FIX: Nullify the manufacturer's hardcoded entrypoint.
-# This ensures Docker boots our Python daemon instead of launching the binary directly.
-ENTRYPOINT ["python3", "app.py"]
+# Felülírjuk a gyári belépési pontot
+ENTRYPOINT ["/app/entrypoint.sh"]
