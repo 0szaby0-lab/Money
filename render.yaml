@@ -14,6 +14,8 @@ services:
         sync: false
       - key: DEVICE_NAME
         value: "Render-Cloudflare-Warp-01"
+      - key: CUSTOM_PROXY
+        sync: false
       - key: WARP_CONF_BASE64
         sync: false
       - key: WARP_PRIVATE_KEY

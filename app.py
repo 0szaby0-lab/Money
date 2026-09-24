@@ -10,6 +10,7 @@ from datetime import datetime
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
+from urllib.parse import urlparse
 
 PORT = int(os.environ.get("PORT", 10000))
 PROXY_PORT = 1080
@@ -40,6 +41,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             "warp_connected": node_state.get("warp_connected", False),
             "warp_ip": node_state.get("warp_ip", "unknown"),
             "warp_type": node_state.get("warp_type", "none"),
+            "custom_proxy_enabled": bool(os.getenv("CUSTOM_PROXY")),
             "honeygain_running": node_state.get("honeygain_running", False),
             "device_name": os.getenv("DEVICE_NAME", "Render-Cloudflare-Warp-01"),
             "uptime_seconds": int(time.time() - node_state["start_time"]),
@@ -153,15 +155,12 @@ def build_wireproxy_conf():
         if "=" in line_s:
             key, val = [x.strip() for x in line_s.split("=", 1)]
             if key == "Address":
-                # Extract only IPv4 address (e.g. 172.16.0.2/32)
                 ipv4_parts = [p.strip() for p in val.split(",") if ":" not in p]
                 val = ipv4_parts[0] if ipv4_parts else "172.16.0.2/32"
                 clean_lines.append(f"Address = {val}")
             elif key == "AllowedIPs":
-                # Route all IPv4 traffic through WARP
                 clean_lines.append("AllowedIPs = 0.0.0.0/0")
             elif key == "DNS":
-                # Route DNS via Cloudflare 1.1.1.1 UDP
                 clean_lines.append("DNS = 1.1.1.1")
             elif key == "Endpoint":
                 clean_lines.append(f"Endpoint = {val}")
@@ -246,8 +245,50 @@ def start_wireproxy():
 
     return proc, False
 
+def parse_custom_proxy(proxy_str):
+    """
+    Parses a proxy string into proxychains format:
+    Supported formats:
+      - socks5://user:pass@host:port
+      - http://user:pass@host:port
+      - socks5 host port user pass
+      - http host port
+    """
+    proxy_str = proxy_str.strip()
+    if not proxy_str:
+        return None
+
+    if "://" in proxy_str:
+        try:
+            parsed = urlparse(proxy_str)
+            proto = parsed.scheme.lower()
+            if proto not in ("socks5", "socks4", "http"):
+                proto = "socks5"
+            host = parsed.hostname
+            port = parsed.port or (1080 if "socks" in proto else 8080)
+            user = parsed.username or ""
+            pwd = parsed.password or ""
+            if user and pwd:
+                return f"{proto} {host} {port} {user} {pwd}"
+            return f"{proto} {host} {port}"
+        except Exception as e:
+            print(f"[PROXYCHAINS] Error parsing proxy URL: {e}")
+            return None
+    else:
+        # Already in proxychains space-delimited format
+        return proxy_str
+
 def setup_proxychains():
-    """Configures proxychains to tunnel all outgoing Honeygain traffic through wireproxy SOCKS5."""
+    """Configures proxychains to tunnel all outgoing Honeygain traffic through wireproxy (and optional chained residential proxy)."""
+    proxy_entries = [f"socks5 127.0.0.1 {PROXY_PORT}"]
+
+    custom_proxy = os.getenv("CUSTOM_PROXY", "").strip()
+    if custom_proxy:
+        parsed_custom = parse_custom_proxy(custom_proxy)
+        if parsed_custom:
+            proxy_entries.append(parsed_custom)
+            print(f"[PROXYCHAINS] Chaining custom proxy: {parsed_custom.split()[0]} {parsed_custom.split()[1]}")
+
     config_body = f"""strict_chain
 proxy_dns
 remote_dns_subnet 224
@@ -255,8 +296,8 @@ tcp_read_time_out 15000
 tcp_connect_time_out 8000
 
 [ProxyList]
-socks5 127.0.0.1 {PROXY_PORT}
-"""
+""" + "\n".join(proxy_entries) + "\n"
+
     for path in ["/etc/proxychains.conf", "/etc/proxychains4.conf"]:
         try:
             with open(path, "w") as f:
@@ -380,7 +421,7 @@ if __name__ == "__main__":
 
     print("[INIT] Cloudflare WARP verified and active!")
 
-    # 4. Configure proxychains
+    # 4. Configure proxychains (WARP + optional CUSTOM_PROXY chain)
     setup_proxychains()
 
     # 5. Launch Honeygain Daemon (only starts after WARP is verified!)
