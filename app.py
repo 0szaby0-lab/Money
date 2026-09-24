@@ -34,6 +34,9 @@ node_state = {
     "pool_size": 0
 }
 
+HG_DOMAIN = b"api.honeygain.com"
+HG_CONNECT_REQ = b"\x05\x01\x00\x03" + bytes([len(HG_DOMAIN)]) + HG_DOMAIN + b"\x01\xbb"
+
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -57,29 +60,34 @@ def run_health_server():
     print(f"[HTTP] Render health check server running on port {PORT}")
     server.serve_forever()
 
-def check_socks5_handshake(proxy_str):
-    """Verifies live SOCKS5 handshake (b'\x05\x01\x00' -> b'\x05\x00') in under 2.0s."""
+def verify_proxy_to_honeygain_api(proxy_str):
+    """
+    Two-step verification:
+    1. SOCKS5 handshake.
+    2. TCP tunnel directly to api.honeygain.com:443.
+    """
     try:
         ip, port = proxy_str.split(":")
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(2.0)
+        s.settimeout(2.5)
         s.connect((ip, int(port)))
+        # Handshake
         s.sendall(b"\x05\x01\x00")
-        resp = s.recv(2)
+        resp1 = s.recv(2)
+        if resp1 != b"\x05\x00":
+            s.close()
+            return None
+        # Connect to api.honeygain.com:443
+        s.sendall(HG_CONNECT_REQ)
+        resp2 = s.recv(10)
         s.close()
-        if resp == b"\x05\x00":
+        if len(resp2) >= 2 and resp2[1] == 0:
             return proxy_str
     except Exception:
         pass
     return None
 
 def fetch_and_filter_residential_proxies():
-    """
-    High-yield pipeline:
-    1. Scrapes proxy feeds.
-    2. Concurrently handshakes 500 candidates (discovering live ones in ~5s).
-    3. Batch-checks live ones with IP-API (filtering for hosting == False / pure residential).
-    """
     print("[HARVESTER] Scraping public SOCKS5 proxy feeds...")
     candidates = set()
     for src in PROXY_SOURCES:
@@ -91,26 +99,26 @@ def fetch_and_filter_residential_proxies():
                     line = line.strip()
                     if ":" in line and not line.startswith("#"):
                         candidates.add(line)
-        except Exception as e:
+        except Exception:
             pass
 
     all_cands = list(candidates)
     random.shuffle(all_cands)
-    test_batch = all_cands[:600]
-    print(f"[HARVESTER] Scraped {len(all_cands)} proxies. Testing live handshakes on {len(test_batch)} candidates...")
+    test_batch = all_cands[:500]
+    print(f"[HARVESTER] Testing full Honeygain API tunnel on {len(test_batch)} candidates...")
 
-    live_proxies = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
-        for res in executor.map(check_socks5_handshake, test_batch):
+    api_capable_proxies = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=80) as executor:
+        for res in executor.map(verify_proxy_to_honeygain_api, test_batch):
             if res:
-                live_proxies.append(res)
+                api_capable_proxies.append(res)
 
-    print(f"[HARVESTER] Live responsive SOCKS5 proxies found: {len(live_proxies)}")
-    if not live_proxies:
+    print(f"[HARVESTER] Proxies with working tunnel to api.honeygain.com: {len(api_capable_proxies)}")
+    if not api_capable_proxies:
         return
 
-    # Check live proxies with IP-API batch for residential classification (max 100 per request)
-    batch_to_query = live_proxies[:100]
+    # Check residential status on API-capable proxies
+    batch_to_query = api_capable_proxies[:100]
     payload = [{"query": p.split(":")[0], "fields": "query,hosting,isp,country"} for p in batch_to_query]
 
     residential_map = {}
@@ -120,13 +128,13 @@ def fetch_and_filter_residential_proxies():
         with urllib.request.urlopen(req, timeout=8) as resp:
             results = json.loads(resp.read().decode())
             for item in results:
-                if not item.get("hosting"):  # hosting == False means Residential ISP!
+                if not item.get("hosting"):
                     residential_map[item.get("query")] = item
     except Exception as e:
         print(f"[HARVESTER] IP-API batch lookup error: {e}")
 
     verified_residential = [p for p in batch_to_query if p.split(":")[0] in residential_map]
-    print(f"[HARVESTER] Verified LIVE Residential proxies found: {len(verified_residential)}")
+    print(f"[HARVESTER] Verified API-REACHABLE Residential proxies: {len(verified_residential)}")
 
     with state_lock:
         for p in verified_residential:
@@ -134,11 +142,10 @@ def fetch_and_filter_residential_proxies():
                 working_residential_pool.append(p)
                 ip = p.split(":")[0]
                 info = residential_map.get(ip, {})
-                print(f"[HARVESTER] Added: {p} -> {info.get('isp')} ({info.get('country')})")
+                print(f"[HARVESTER] Verified ready: {p} -> {info.get('isp')} ({info.get('country')})")
         node_state["pool_size"] = len(working_residential_pool)
 
 def background_harvester():
-    """Keeps the residential pool well-stocked."""
     while True:
         try:
             with state_lock:
@@ -203,11 +210,11 @@ def supervise_honeygain():
                         node_state["pool_size"] = len(working_residential_pool)
                 if not target_proxy:
                     with state_lock:
-                        node_state["status"] = "Harvesting live residential proxies..."
+                        node_state["status"] = "Harvesting API-verified residential proxies..."
                     time.sleep(2)
 
         ip, port = target_proxy.split(":")
-        print(f"\n[SUPERVISOR] >>> Connecting Honeygain via Residential Proxy: {target_proxy} <<<")
+        print(f"\n[SUPERVISOR] >>> Launching Honeygain via API-Verified Residential Node: {target_proxy} <<<")
         update_proxychains(ip, port)
 
         with state_lock:
@@ -257,7 +264,7 @@ def supervise_honeygain():
             if rejected:
                 time.sleep(1)
             else:
-                print("[SUPERVISOR] Process ended. Reconnecting in 3s...")
+                print(f"[SUPERVISOR] Node {target_proxy} exited (code {proc.returncode}). Reconnecting in 3s...")
                 time.sleep(3)
 
         except Exception as e:
@@ -269,15 +276,12 @@ if __name__ == "__main__":
     print(" Honeygain 24/7 Residential Auto-Harvest Node for Render")
     print("=========================================================")
     
-    # 1. Start HTTP health check server for Render (responds 200 OK on $PORT)
     server_t = Thread(target=run_health_server, daemon=True)
     server_t.start()
 
-    # 2. Initial Residential Harvest Sweep
     if not CUSTOM_PROXY:
         fetch_and_filter_residential_proxies()
         harvester_t = Thread(target=background_harvester, daemon=True)
         harvester_t.start()
 
-    # 3. Supervise Honeygain with auto-failover
     supervise_honeygain()
