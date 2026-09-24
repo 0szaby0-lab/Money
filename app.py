@@ -1,33 +1,41 @@
-# app.py - Cloudflare 1.1.1.1 WARP Tunnel & Honeygain Node Orchestrator
+# app.py - Automated Public SOCKS5 Harvester, Validator & Honeygain Supervisor
 import os
 import sys
 import time
 import shutil
-import base64
 import socket
+import random
 import subprocess
-from datetime import datetime
-from threading import Thread
+import urllib.request
+import concurrent.futures
+from threading import Thread, Lock
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
-from urllib.parse import urlparse
 
 PORT = int(os.environ.get("PORT", 10000))
-PROXY_PORT = 1080
-WARP_ENDPOINT_DEFAULT = "engage.cloudflareclient.com:2408"
-WARP_PEER_PUBKEY_DEFAULT = "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
-APP_DIR = "/app"
-WGCF_PROFILE_PATH = os.path.join(APP_DIR, "wgcf-profile.conf")
-WIREPROXY_CONF_PATH = os.path.join(APP_DIR, "wireproxy.conf")
+PROXY_SOURCES = [
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+    "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+    "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/socks5.txt",
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt"
+]
+
+state_lock = Lock()
+working_pool = []
+tested_counter = 0
 
 node_state = {
     "start_time": time.time(),
-    "warp_connected": False,
-    "warp_ip": "unknown",
-    "warp_type": "none",
+    "status": "Initializing proxy harvester...",
+    "active_proxy": "none",
+    "pool_size": 0,
+    "tested_total": 0,
     "honeygain_running": False,
-    "last_log": "Initializing system...",
-    "restarts": 0
+    "device_name": os.getenv("DEVICE_NAME", "Render-AutoHarvest-Node"),
+    "last_log": "Booting system...",
+    "attempts": 0,
+    "successful_runs": 0
 }
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -35,18 +43,19 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        payload = {
-            "service": "Honeygain Cloudflare WARP Node",
-            "mode": "Traffic and DNS (UDP) - 1.1.1.1 WARP",
-            "warp_connected": node_state.get("warp_connected", False),
-            "warp_ip": node_state.get("warp_ip", "unknown"),
-            "warp_type": node_state.get("warp_type", "none"),
-            "custom_proxy_enabled": bool(os.getenv("CUSTOM_PROXY")),
-            "honeygain_running": node_state.get("honeygain_running", False),
-            "device_name": os.getenv("DEVICE_NAME", "Render-Cloudflare-Warp-01"),
-            "uptime_seconds": int(time.time() - node_state["start_time"]),
-            "last_log": node_state.get("last_log", "")
-        }
+        with state_lock:
+            payload = {
+                "service": "Honeygain Auto-Harvesting SOCKS5 Node",
+                "mode": "Automated Public Proxy Hunting & Validation",
+                "status": node_state["status"],
+                "active_proxy": node_state["active_proxy"],
+                "verified_pool_size": len(working_pool),
+                "tested_total": node_state["tested_total"],
+                "honeygain_running": node_state["honeygain_running"],
+                "device_name": node_state["device_name"],
+                "uptime_seconds": int(time.time() - node_state["start_time"]),
+                "last_log": node_state["last_log"]
+            }
         self.wfile.write(json.dumps(payload, indent=2).encode("utf-8"))
 
     def log_message(self, format, *args):
@@ -57,303 +66,196 @@ def run_health_server():
     httpd = HTTPServer(server_address, HealthCheckHandler)
     httpd.serve_forever()
 
-def setup_warp():
-    """Configures WireGuard / Cloudflare WARP configuration file."""
-    # 1. Check if user provided manual base64 config
-    b64_conf = os.getenv("WARP_CONF_BASE64", "").strip()
-    if b64_conf:
-        print("[WARP-INIT] Found WARP_CONF_BASE64 environment variable. Decoding...")
-        try:
-            raw_conf = base64.b64decode(b64_conf).decode("utf-8")
-            with open(WGCF_PROFILE_PATH, "w") as f:
-                f.write(raw_conf)
-            print(f"[WARP-INIT] Saved decoded WARP configuration to {WGCF_PROFILE_PATH}")
-            return True
-        except Exception as e:
-            print(f"[WARP-INIT] Error decoding WARP_CONF_BASE64: {e}")
-
-    # 2. Check if user provided WARP_PRIVATE_KEY
-    priv_key = os.getenv("WARP_PRIVATE_KEY", "").strip()
-    if priv_key:
-        print("[WARP-INIT] Found WARP_PRIVATE_KEY environment variable. Generating profile...")
-        address = os.getenv("WARP_ADDRESS", "172.16.0.2/32").strip()
-        pubkey = os.getenv("WARP_PEER_PUBLIC_KEY", WARP_PEER_PUBKEY_DEFAULT).strip()
-        endpoint = os.getenv("WARP_ENDPOINT", WARP_ENDPOINT_DEFAULT).strip()
-
-        conf_content = f"""[Interface]
-PrivateKey = {priv_key}
-Address = {address}
-DNS = 1.1.1.1
-
-[Peer]
-PublicKey = {pubkey}
-Endpoint = {endpoint}
-AllowedIPs = 0.0.0.0/0
-"""
-        with open(WGCF_PROFILE_PATH, "w") as f:
-            f.write(conf_content)
-        print(f"[WARP-INIT] Custom WARP profile created at {WGCF_PROFILE_PATH}")
-        return True
-
-    # 3. Check if profile already exists in working dir
-    if os.path.exists(WGCF_PROFILE_PATH) and os.path.getsize(WGCF_PROFILE_PATH) > 0:
-        print(f"[WARP-INIT] Existing configuration found at {WGCF_PROFILE_PATH}")
-        return True
-
-    # 4. Attempt automated registration using wgcf
-    print("[WARP-INIT] Attempting automated WARP registration via wgcf...")
+def test_socks5_candidate(proxy_str):
+    """
+    Tests raw SOCKS5 handshake directly towards api.honeygain.com:443.
+    Returns (proxy_str, latency) if successful, None otherwise.
+    """
     try:
-        reg_res = subprocess.run(
-            ["wgcf", "register", "--accept-tos"],
-            cwd=APP_DIR,
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-        if reg_res.returncode == 0:
-            print("[WARP-INIT] Cloudflare WARP account registered successfully.")
-            gen_res = subprocess.run(
-                ["wgcf", "generate"],
-                cwd=APP_DIR,
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            if gen_res.returncode == 0 and os.path.exists(WGCF_PROFILE_PATH):
-                print("[WARP-INIT] wgcf WireGuard profile generated successfully.")
-                return True
-            else:
-                err_msg = gen_res.stderr or gen_res.stdout
-                print(f"[WARP-INIT] Failed to generate wgcf profile: {err_msg}")
-        else:
-            err_msg = reg_res.stderr or reg_res.stdout
-            print(f"[WARP-INIT] wgcf register failed (code {reg_res.returncode}): {err_msg}")
-    except Exception as e:
-        print(f"[WARP-INIT] Auto-registration encountered exception: {e}")
+        ip, port = proxy_str.split(":")
+        port = int(port)
+        start_t = time.time()
 
-    print("[WARP-INIT] Notice: Automated registration was rate-limited or blocked by Cloudflare API.")
-    print("[WARP-INIT] You can run 'python register_warp.py' on your local computer,")
-    print("[WARP-INIT] then copy WARP_PRIVATE_KEY or WARP_CONF_BASE64 into the Render dashboard.")
-    return False
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(2.5)
+        s.connect((ip, port))
 
-def build_wireproxy_conf():
-    """Generates wireproxy.conf from the WireGuard profile, ensuring proper IPv4 routing and SOCKS5 proxy."""
-    if not os.path.exists(WGCF_PROFILE_PATH):
-        raise FileNotFoundError(f"Missing {WGCF_PROFILE_PATH}")
-
-    with open(WGCF_PROFILE_PATH, "r") as f:
-        raw_conf = f.read()
-
-    clean_lines = []
-    for line in raw_conf.splitlines():
-        line_s = line.strip()
-        if not line_s or line_s.startswith("#"):
-            continue
-        if line_s.startswith("["):
-            clean_lines.append(line_s)
-            continue
-        if "=" in line_s:
-            key, val = [x.strip() for x in line_s.split("=", 1)]
-            if key == "Address":
-                ipv4_parts = [p.strip() for p in val.split(",") if ":" not in p]
-                val = ipv4_parts[0] if ipv4_parts else "172.16.0.2/32"
-                clean_lines.append(f"Address = {val}")
-            elif key == "AllowedIPs":
-                clean_lines.append("AllowedIPs = 0.0.0.0/0")
-            elif key == "DNS":
-                clean_lines.append("DNS = 1.1.1.1")
-            elif key == "Endpoint":
-                clean_lines.append(f"Endpoint = {val}")
-            else:
-                clean_lines.append(f"{key} = {val}")
-
-    proxy_section = f"""
-[Socks5]
-BindAddress = 127.0.0.1:{PROXY_PORT}
-"""
-    with open(WIREPROXY_CONF_PATH, "w") as f:
-        f.write("\n".join(clean_lines) + proxy_section)
-
-    print(f"[WIREPROXY] wireproxy.conf created successfully at {WIREPROXY_CONF_PATH}")
-
-def start_wireproxy():
-    """Launches wireproxy daemon in userspace and verifies the Cloudflare WARP tunnel."""
-    build_wireproxy_conf()
-    print("[WIREPROXY] Starting wireproxy daemon (Userspace WireGuard UDP tunnel)...")
-    proc = subprocess.Popen(
-        ["wireproxy", "-c", WIREPROXY_CONF_PATH],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1
-    )
-
-    def log_stream():
-        for line in proc.stdout:
-            print(f"[WIREPROXY] {line.strip()}")
-
-    Thread(target=log_stream, daemon=True).start()
-
-    # Wait for SOCKS5 proxy to listen
-    print(f"[WIREPROXY] Waiting for SOCKS5 port {PROXY_PORT}...")
-    for _ in range(30):
-        try:
-            with socket.create_connection(("127.0.0.1", PROXY_PORT), timeout=1):
-                print(f"[WIREPROXY] SOCKS5 proxy is listening on 127.0.0.1:{PROXY_PORT}!")
-                break
-        except (socket.error, ConnectionRefusedError):
-            time.sleep(1)
-    else:
-        print("[WIREPROXY] SOCKS5 proxy port failed to open within 30s.")
-        return proc, False
-
-    # Verify connection through Cloudflare trace
-    print("[WIREPROXY] Testing connection through Cloudflare WARP tunnel...")
-    for attempt in range(6):
-        try:
-            res = subprocess.run(
-                [
-                    "curl", "-s",
-                    "--socks5-hostname", f"127.0.0.1:{PROXY_PORT}",
-                    "--max-time", "8",
-                    "https://cloudflare.com/cdn-cgi/trace"
-                ],
-                capture_output=True,
-                text=True
-            )
-            output = res.stdout.strip()
-            if "warp=" in output:
-                warp_val = "off"
-                ip_val = "unknown"
-                for line in output.splitlines():
-                    if line.startswith("warp="):
-                        warp_val = line.split("=")[1].strip()
-                    if line.startswith("ip="):
-                        ip_val = line.split("=")[1].strip()
-
-                if warp_val in ("on", "plus"):
-                    node_state["warp_connected"] = True
-                    node_state["warp_ip"] = ip_val
-                    node_state["warp_type"] = warp_val
-                    print(f"[WIREPROXY] Tunnel confirmed! WARP: {warp_val}, Exit IP: {ip_val}")
-                    return proc, True
-                else:
-                    print(f"[WIREPROXY] Trace responded but warp={warp_val}")
-        except Exception as e:
-            print(f"[WIREPROXY] Tunnel verification attempt {attempt+1} failed: {e}")
-        time.sleep(2)
-
-    return proc, False
-
-def parse_custom_proxy(proxy_str):
-    """
-    Parses a proxy string into proxychains format:
-    Supported formats:
-      - socks5://user:pass@host:port
-      - http://user:pass@host:port
-      - socks5 host port user pass
-      - http host port
-    """
-    proxy_str = proxy_str.strip()
-    if not proxy_str:
-        return None
-
-    if "://" in proxy_str:
-        try:
-            parsed = urlparse(proxy_str)
-            proto = parsed.scheme.lower()
-            if proto not in ("socks5", "socks4", "http"):
-                proto = "socks5"
-            host = parsed.hostname
-            port = parsed.port or (1080 if "socks" in proto else 8080)
-            user = parsed.username or ""
-            pwd = parsed.password or ""
-            if user and pwd:
-                return f"{proto} {host} {port} {user} {pwd}"
-            return f"{proto} {host} {port}"
-        except Exception as e:
-            print(f"[PROXYCHAINS] Error parsing proxy URL: {e}")
+        # Greeting: SOCKS5, 1 auth method (0x00 = No Auth)
+        s.sendall(b"\x05\x01\x00")
+        resp = s.recv(2)
+        if resp != b"\x05\x00":
+            s.close()
             return None
-    else:
-        # Already in proxychains space-delimited format
-        return proxy_str
 
-def setup_proxychains():
-    """Configures proxychains to tunnel all outgoing Honeygain traffic through wireproxy (and optional chained residential proxy)."""
-    proxy_entries = [f"socks5 127.0.0.1 {PROXY_PORT}"]
+        # Connect request: connect to api.honeygain.com:443 via proxy
+        target = b"api.honeygain.com"
+        req = b"\x05\x01\x00\x03" + bytes([len(target)]) + target + (443).to_bytes(2, "big")
+        s.sendall(req)
+        resp2 = s.recv(10)
+        s.close()
 
-    custom_proxy = os.getenv("CUSTOM_PROXY", "").strip()
-    if custom_proxy:
-        parsed_custom = parse_custom_proxy(custom_proxy)
-        if parsed_custom:
-            proxy_entries.append(parsed_custom)
-            print(f"[PROXYCHAINS] Chaining custom proxy: {parsed_custom.split()[0]} {parsed_custom.split()[1]}")
+        # Reply: version 5, status 0 (Success)
+        if len(resp2) >= 4 and resp2[0] == 5 and resp2[1] == 0:
+            latency = round(time.time() - start_t, 3)
+            return (proxy_str, latency)
+    except Exception:
+        pass
+    return None
 
-    config_body = f"""strict_chain
+def harvest_and_validate_batch(batch_size=150):
+    """Fetches candidate proxies from multiple public repositories and validates a batch."""
+    global tested_counter
+    print("[HARVESTER] Scraping public SOCKS5 proxy feeds...")
+    candidates = set()
+    for src in PROXY_SOURCES:
+        try:
+            req = urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = resp.read().decode("utf-8", errors="ignore")
+                for line in data.splitlines():
+                    line = line.strip()
+                    if line and ":" in line and not line.startswith("#"):
+                        candidates.add(line)
+        except Exception as e:
+            print(f"[HARVESTER] Note: {src.split('/')[-1]} skipped: {e}")
+
+    all_list = list(candidates)
+    random.shuffle(all_list)
+    print(f"[HARVESTER] Total unique candidates discovered: {len(all_list)}. Testing batch of {min(batch_size, len(all_list))}...")
+
+    batch = all_list[:batch_size]
+    with state_lock:
+        tested_counter += len(batch)
+        node_state["tested_total"] = tested_counter
+
+    verified = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+        for res in executor.map(test_socks5_candidate, batch):
+            if res:
+                verified.append(res)
+
+    verified.sort(key=lambda x: x[1])
+    print(f"[HARVESTER] Batch complete. Valid operational proxies found: {len(verified)}")
+    with state_lock:
+        for p, lat in verified:
+            if p not in working_pool:
+                working_pool.append(p)
+        node_state["pool_size"] = len(working_pool)
+
+def background_harvester_daemon():
+    """Continuously ensures the working proxy pool stays populated."""
+    while True:
+        try:
+            with state_lock:
+                current_pool_len = len(working_pool)
+            if current_pool_len < 10:
+                print(f"[POOL-MONITOR] Pool low ({current_pool_len} left). Triggering harvest sweep...")
+                harvest_and_validate_batch(batch_size=200)
+        except Exception as e:
+            print(f"[HARVESTER] Error during harvest cycle: {e}")
+        time.sleep(30)
+
+def update_proxychains_conf(ip, port):
+    """Configures proxychains to route all TCP connections through the chosen proxy."""
+    content = f"""strict_chain
 proxy_dns
 remote_dns_subnet 224
-tcp_read_time_out 15000
-tcp_connect_time_out 8000
+tcp_read_time_out 10000
+tcp_connect_time_out 5000
 
 [ProxyList]
-""" + "\n".join(proxy_entries) + "\n"
-
-    for path in ["/etc/proxychains.conf", "/etc/proxychains4.conf"]:
+socks5 {ip} {port}
+"""
+    for p in ["/etc/proxychains.conf", "/etc/proxychains4.conf"]:
         try:
-            with open(path, "w") as f:
-                f.write(config_body)
-            print(f"[PROXYCHAINS] Written proxy configuration to {path}")
-        except Exception as e:
+            with open(p, "w") as f:
+                f.write(content)
+        except Exception:
             pass
 
 def find_honeygain_binary():
-    """Locates the Honeygain executable inside the container."""
-    candidate = shutil.which("honeygain")
-    if candidate:
-        return candidate
+    """Locates the Honeygain executable."""
+    b = shutil.which("honeygain")
+    if b:
+        return b
     for p in ["/app/honeygain", "/honeygain", "/bin/honeygain", "/usr/local/bin/honeygain"]:
         if os.path.exists(p):
             return p
     return None
 
-def run_honeygain():
-    """Executes the Honeygain client routed through proxychains and Cloudflare WARP."""
+def supervise_honeygain():
+    """Main worker loop: tests candidate proxies against Honeygain and locks onto working ones."""
     email = os.getenv("HNY_EMAIL", "").strip()
     password = os.getenv("HNY_PASS", "").strip()
-    device = os.getenv("DEVICE_NAME", "Render-Cloudflare-Warp-01").strip()
+    device = os.getenv("DEVICE_NAME", "Render-AutoHarvest-Node").strip()
+    custom_proxy = os.getenv("CUSTOM_PROXY", "").strip()
 
     if not email or not password:
-        print("[HONEYGAIN] WARNING: HNY_EMAIL or HNY_PASS environment variables are missing.")
-        print("[HONEYGAIN] Go to Render Dashboard -> Environment Variables to set HNY_EMAIL and HNY_PASS.")
-        node_state["last_log"] = "Waiting for HNY_EMAIL and HNY_PASS configuration"
+        print("[SUPERVISOR] ERROR: HNY_EMAIL or HNY_PASS environment variables are missing.")
+        with state_lock:
+            node_state["last_log"] = "Missing HNY_EMAIL / HNY_PASS"
         while True:
             time.sleep(30)
 
     bin_path = find_honeygain_binary()
     if not bin_path:
-        print("[HONEYGAIN] ERROR: Unable to locate honeygain binary in container.")
-        node_state["last_log"] = "honeygain binary not found"
+        print("[SUPERVISOR] ERROR: Honeygain binary not found in container.")
+        with state_lock:
+            node_state["last_log"] = "Binary honeygain missing"
         while True:
             time.sleep(30)
 
     proxychains_bin = "proxychains4" if shutil.which("proxychains4") else "proxychains"
-    print(f"[HONEYGAIN] Using proxy wrapper: {proxychains_bin}")
-    print(f"[HONEYGAIN] Executable path: {bin_path}")
-    print(f"[HONEYGAIN] Device Name: {device}")
-    print(f"[HONEYGAIN] Email: {email[:3]}***@{email.split('@')[-1] if '@' in email else '***'}")
-
-    cmd = [
-        proxychains_bin, "-q",
-        bin_path,
-        "-tou-accept",
-        "-email", email,
-        "-pass", password,
-        "-device", device
-    ]
 
     while True:
+        # Check if user set static CUSTOM_PROXY
+        if custom_proxy:
+            active_target = custom_proxy
+            if "://" in custom_proxy:
+                from urllib.parse import urlparse
+                u = urlparse(custom_proxy)
+                target_ip = u.hostname
+                target_port = u.port or 1080
+            else:
+                parts = custom_proxy.split()
+                target_ip = parts[1] if len(parts) > 1 else "127.0.0.1"
+                target_port = parts[2] if len(parts) > 2 else "1080"
+        else:
+            # Pop next proxy from verified working pool
+            proxy_candidate = None
+            while not proxy_candidate:
+                with state_lock:
+                    if working_pool:
+                        proxy_candidate = working_pool.pop(0)
+                        node_state["pool_size"] = len(working_pool)
+                if not proxy_candidate:
+                    print("[SUPERVISOR] Waiting for proxy harvester to find candidates...")
+                    with state_lock:
+                        node_state["status"] = "Harvesting fresh proxies..."
+                    time.sleep(3)
+
+            target_ip, target_port = proxy_candidate.split(":")
+            active_target = proxy_candidate
+
+        with state_lock:
+            node_state["attempts"] += 1
+            node_state["active_proxy"] = active_target
+            node_state["status"] = f"Testing candidate node: {active_target} (attempt #{node_state['attempts']})"
+            node_state["honeygain_running"] = True
+
+        print(f"\n[SUPERVISOR] === Launching Honeygain on node: {active_target} ===")
+        update_proxychains_conf(target_ip, target_port)
+
+        cmd = [
+            proxychains_bin, "-q",
+            bin_path,
+            "-tou-accept",
+            "-email", email,
+            "-pass", password,
+            "-device", device
+        ]
+
         try:
-            print("[HONEYGAIN] Starting Honeygain daemon over 1.1.1.1 WARP...")
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -361,68 +263,63 @@ def run_honeygain():
                 text=True,
                 bufsize=1
             )
-            node_state["honeygain_running"] = True
-            node_state["last_log"] = "Honeygain daemon active"
+
+            rejected_by_network = False
+            start_launch_time = time.time()
 
             for line in proc.stdout:
-                clean_line = line.strip()
-                print(f"[HG-NODE] {clean_line}")
-                node_state["last_log"] = clean_line
+                clean = line.strip()
+                print(f"[HG-NODE] {clean}")
+                with state_lock:
+                    node_state["last_log"] = clean
+
+                # Detect network unusable / fraud block
+                if "API Error: Network Unusable" in clean or "Network Overused" in clean:
+                    print(f"[SUPERVISOR] Node {active_target} rejected by Honeygain perimeter ({clean}).")
+                    rejected_by_network = True
+                    proc.terminate()
+                    break
+
+                # If running for more than 40 seconds without rejection, it is accepted!
+                elapsed = time.time() - start_launch_time
+                if elapsed > 40 and not rejected_by_network:
+                    with state_lock:
+                        node_state["status"] = f"ACTIVE & EARNING via {active_target}"
+                        node_state["successful_runs"] += 1
+                        print(f"[SUCCESS] === Candidate {active_target} ACCEPTED by Honeygain! Running active node. ===")
 
             proc.wait()
-            node_state["honeygain_running"] = False
-            node_state["restarts"] += 1
-            print(f"[HONEYGAIN] Process exited (code {proc.returncode}). Restarting in 10s...")
-            time.sleep(10)
+            with state_lock:
+                node_state["honeygain_running"] = False
+
+            if rejected_by_network:
+                print(f"[SUPERVISOR] Rotating to next candidate in queue...\n")
+                time.sleep(1)
+            else:
+                print(f"[SUPERVISOR] Process exited. Waiting 5s before reconnecting...\n")
+                time.sleep(5)
+
         except Exception as e:
-            print(f"[HONEYGAIN] Exception during execution: {e}")
-            node_state["honeygain_running"] = False
-            time.sleep(15)
+            print(f"[SUPERVISOR] Exception during execution: {e}")
+            time.sleep(3)
 
 if __name__ == "__main__":
-    node_state["start_time"] = time.time()
     print("==================================================")
-    print(" Honeygain + Cloudflare 1.1.1.1 WARP (Render Node)")
-    print(" Mode: Traffic and DNS (UDP)")
+    print(" Honeygain Automated Public Proxy Hunter & Runner")
+    print(" Mode: Multi-Source Harvesting & Active Failover")
     print("==================================================")
 
-    # 1. Boot HTTP Health Check Server
-    http_thread = Thread(target=run_health_server, daemon=True)
-    http_thread.start()
-    print(f"[SERVER] Health check web server running on 0.0.0.0:{PORT}")
+    # 1. Start HTTP Health Server for Render
+    health_thread = Thread(target=run_health_server, daemon=True)
+    health_thread.start()
+    print(f"[SYSTEM] Render health check server listening on 0.0.0.0:{PORT}")
 
-    # 2. Establish Cloudflare WARP Profile
-    warp_configured = False
-    retry_attempt = 0
-    while not warp_configured:
-        warp_configured = setup_warp()
-        if not warp_configured:
-            retry_attempt += 1
-            node_state["last_log"] = f"Waiting for WARP setup (attempt #{retry_attempt})"
-            print(f"[SERVER] Retrying WARP setup in 20 seconds (attempt #{retry_attempt})...")
-            time.sleep(20)
+    # 2. Initial Proxy Harvesting Sweep
+    harvest_and_validate_batch(batch_size=150)
 
-    # 3. Start wireproxy daemon and loop until tunnel is confirmed active!
-    wireproxy_proc = None
-    tunnel_active = False
-    attempt = 0
-    while not tunnel_active:
-        attempt += 1
-        print(f"[INIT] Establishing Cloudflare WARP tunnel (attempt #{attempt})...")
-        if wireproxy_proc and wireproxy_proc.poll() is None:
-            wireproxy_proc.terminate()
-            time.sleep(2)
+    # 3. Start background harvester thread
+    harvester_t = Thread(target=background_harvester_daemon, daemon=True)
+    harvester_t.start()
 
-        wireproxy_proc, tunnel_active = start_wireproxy()
-        if not tunnel_active:
-            node_state["last_log"] = f"WARP connecting... (attempt #{attempt})"
-            print(f"[INIT] WARP tunnel not verified yet. Retrying in 10s...")
-            time.sleep(10)
-
-    print("[INIT] Cloudflare WARP verified and active!")
-
-    # 4. Configure proxychains (WARP + optional CUSTOM_PROXY chain)
-    setup_proxychains()
-
-    # 5. Launch Honeygain Daemon (only starts after WARP is verified!)
-    run_honeygain()
+    # 4. Run Honeygain Supervisor with Auto-Rotation
+    supervise_honeygain()

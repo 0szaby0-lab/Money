@@ -1,76 +1,53 @@
-# Honeygain + Cloudflare 1.1.1.1 WARP (Render.com Node)
+# Honeygain Automated Public Proxy Hunter & Runner (Render.com)
 
-Ez a projekt lehetővé teszi a **Honeygain** futtatását a [Render.com](https://render.com) ingyenes (Free Web Service) felhős környezetében úgy, hogy a teljes hálózati forgalom és a DNS-lekérdezések a **Cloudflare 1.1.1.1 WARP (UDP WireGuard)** alagúton keresztül mennek át.
+Ez a rendszer önállóan, automatikusan keres és tesztel **több ezer publikus SOCKS5 proxyt**, ellenőrzi az elérhetőségüket és közvetlen kapcsolatukat a Honeygain szervereivel, majd elindítja a Honeygaint.
 
-Ez megoldja a Render közvetlen adatközponti IP-címének letiltását (*"API Error: Network Unusable"*).
-
----
-
-## 🚀 Hogyan működik? (Architektúra)
-
-1. **Cloudflare WARP (Traffic and DNS - UDP)**:
-   A container a Cloudflare hivatalos WireGuard hálózatára csatlakozik (UDP 2408-as porton a `162.159.192.1` / `engage.cloudflareclient.com` végpontra).
-2. **Userspace WireGuard (`wireproxy`)**:
-   Mivel a Render nem engedélyezi a `--cap-add=NET_ADMIN` jogosultságot és a `/dev/net/tun` virtuális eszközt, a WireGuard kapcsolat tisztán felhasználói rétegben (userspace Go netstack) épül fel, root/kernel jogosultságok nélkül.
-3. **SOCKS5 + Proxychains4**:
-   A `wireproxy` egy helyi SOCKS5 interfészt biztosít (`127.0.0.1:1080`), amelyen keresztül a `proxychains4` segítségével a Honeygain kliens összes TCP kapcsolata és DNS feloldása közvetlenül a Cloudflare 1.1.1.1 hálózatán fut.
-4. **Render HTTP Health Check Server**:
-   A Render ingyenes Web Service-ként vár egy élő HTTP szervert a `$PORT` porton (10000). A beépített Python szerver 200 OK státuszt és élő állapotjelentést küld a Rendernek.
+Amint egy IP-t a Honeygain elutasít (`API Error: Network Unusable`), a felügyelő démon azonnal (1-2 másodpercen belül) továbbugrik a következő ellenőrzött, működő jelöltre, amíg meg nem találja azt, ami aktív és elfogadott!
 
 ---
 
-## 🛠️ Telepítés Render.com-ra
+## ⚡ Főbb funkciók
 
-### 1. Lépés: Repository Fork / Csatlakoztatás
-1. Nyisd meg a [Render Dashboardot](https://dashboard.render.com).
-2. Kattints a **New +** -> **Web Service** gombra.
-3. Válaszd ki a GitHub fiókodhoz csatolt `Money` repót.
-
-### 2. Lépés: Beállítások (Render Web Service)
-- **Name:** `honeygain-warp-node` (vagy tetszőleges)
-- **Region:** Frankfurt (vagy Ohio / Oregon)
-- **Runtime:** `Docker`
-- **Instance Type:** `Free`
-
-### 3. Lépés: Környezeti változók (Environment Variables)
-
-A Render felületén a **Environment** fül alatt állítsd be az alábbi változókat:
-
-| Változó | Leírás | Kötelező? | Példa érték |
-|---|---|:---:|---|
-| `HNY_EMAIL` | A Honeygain fiókod email címe | **Igen** | `pelda@gmail.com` |
-| `HNY_PASS` | A Honeygain fiókod jelszava | **Igen** | `Jelszavad123` |
-| `DEVICE_NAME` | Az eszköz neve a Honeygain dashboardon | Nem | `Render-Warp-Node` |
-| `WARP_PRIVATE_KEY` | Saját Cloudflare WARP WireGuard privát kulcs | Opcionális* | `aB3...=` |
-| `WARP_ADDRESS` | Saját Cloudflare WARP belső IP | Opcionális* | `172.16.0.2/32` |
-| `WARP_CONF_BASE64` | Teljes WireGuard profil Base64 kódolva | Opcionális* | `W0ludGVyZmFjZV0...` |
-
-> 💡 **Megjegyzés:** Ha nem adsz meg saját WARP kulcsot, a container automatikusan megpróbál regisztrálni egy új Cloudflare WARP profilt a `wgcf` segítségével. Ha a Cloudflare API az adatközponti IP miatt korlátozná az automatikus regisztrációt, futtasd a mellékelt `python register_warp.py` scriptet a gépeden, és másold be a kapott kulcsokat a Render Environment fülre!
+1. **Automatikus forrásgyűjtés (Multi-Source Harvesting):**
+   Több megbízható és folyamatosan frissülő publikus GitHub repo-ból gyűjti a SOCKS5 proxykat (monosans, TheSpeedX, hookzof, MuRongPIG).
+2. **Ultragyors natív socket tesztelő:**
+   Párhuzamos szálakon (50 szál) teszteli a proxyk SOCKS5 kézfogását és közvetlen csatlakozását az `api.honeygain.com:443`-hoz. A nem válaszoló vagy lassú proxykat azonnal kiszűri.
+3. **Aktív hibatűrés és forgatás (Active Failover):**
+   A Honeygain naplóját valós időben figyeli. Ha `API Error: Network Unusable` üzenetet kap, 1 másodperc alatt leállítja a folyamatot, átírja a proxychains konfigurációt, és a következő működő proxyval újrapróbálja.
+4. **Automatikus utánpótlás (Background Daemon):**
+   Amikor az ellenőrzött proxyk száma 10 alá esik, a háttérben automatikusan újabb 200 fős kört tesztel le, így soha nem fogy el a működő proxyk sora.
+5. **Render 24/7 Health Check:**
+   A `$PORT` (10000) porton JSON formátumú élő telemetriát szolgáltat (aktuális proxy, medence mérete, státusz).
 
 ---
 
-## 💻 Saját WARP profil generálása (1 kattintással)
+## 🛠️ Beállítás a Render.com-on
 
-Ha szeretnél saját WARP kulcsot használni:
-```bash
-python register_warp.py
-```
-A script automatikusan regisztrál egy profilt és kiírja a Renderbe másolandó kulcsokat.
+A Render Dashboard **Environment** fülén mindössze a Honeygain adataid kellenek:
+
+| Változó | Leírás | Kötelező? |
+|---|---|:---:|
+| `HNY_EMAIL` | A Honeygain fiókod email címe | **Igen** |
+| `HNY_PASS` | A Honeygain fiókod jelszava | **Igen** |
+| `DEVICE_NAME` | Eszköz neve a dashboardon | Nem (alapértelmezett: `Render-AutoHarvest-Node`) |
+| `CUSTOM_PROXY` | Ha van saját privát proxyd, felülbírálja az automatát | Opcionális |
 
 ---
 
-## 📊 Állapot lekérdezése
+## 📊 Élő állapot ellenőrzése
 
-A Render által generált URL-t (`https://<app-name>.onrender.com/`) böngészőben megnyitva egy JSON állapotképet kapsz:
+Nyisd meg a Render URL-t (pl. `https://money-wubo.onrender.com/`):
 ```json
 {
-  "service": "Honeygain Cloudflare WARP Node",
-  "mode": "Traffic and DNS (UDP) - 1.1.1.1 WARP",
-  "warp_connected": true,
-  "warp_ip": "104.28.x.x",
-  "warp_type": "on",
+  "service": "Honeygain Auto-Harvesting SOCKS5 Node",
+  "mode": "Automated Public Proxy Hunting & Validation",
+  "status": "ACTIVE & EARNING via 5.75.133.113:10814",
+  "active_proxy": "5.75.133.113:10814",
+  "verified_pool_size": 24,
+  "tested_total": 450,
   "honeygain_running": true,
-  "device_name": "Render-Cloudflare-Warp-01",
-  "uptime_seconds": 3600
+  "device_name": "ArmorOS-Render-Node-01",
+  "uptime_seconds": 3600,
+  "last_log": "Honeygain service is starting"
 }
 ```
